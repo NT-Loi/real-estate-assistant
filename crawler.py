@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# pyrefly: ignore [missing-import]
 from playwright.async_api import async_playwright, Page, TimeoutError as PwTimeout
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,21 @@ LISTING_URLS = {
     "ban": f"{BASE_URL}/nha-dat-ban",
     "cho-thue": f"{BASE_URL}/nha-dat-cho-thue",
 }
+
+# --- New section URLs ---
+PROJECT_URL = f"{BASE_URL}/du-an-bat-dong-san"
+NEWS_URL = f"{BASE_URL}/tin-tuc"
+WIKI_URL = f"{BASE_URL}/wiki"
+WIKI_CATEGORIES = {
+    "mua-bds": "Mua BĐS",
+    "ban-bds": "Bán BĐS",
+    "thue-bds": "Thuê BĐS",
+    "tai-chinh": "Tài chính BĐS",
+    "quy-hoach-phap-ly": "Quy hoạch - Pháp lý",
+    "noi-ngoai-that": "Nội - Ngoại thất",
+    "phong-tuc": "Phong tục",
+}
+
 MAX_PAGES = 3  # Number of listing pages to crawl (change as needed)
 DATA_DIR = Path(__file__).parent / "data"
 REQUEST_DELAY = 2.0  # Seconds between page navigations (be polite)
@@ -549,7 +565,539 @@ async def crawl(
 
 
 # ---------------------------------------------------------------------------
+# Shared browser setup
+# ---------------------------------------------------------------------------
+STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = { runtime: {} };
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            originalQuery(parameters)
+    );
+"""
+
+CONTEXT_OPTS = dict(
+    user_agent=(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    viewport={"width": 1440, "height": 900},
+    locale="vi-VN",
+)
+
+
+async def _launch_browser(pw):
+    return await pw.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+
+
+async def _new_stealth_page(browser):
+    context = await browser.new_context(**CONTEXT_OPTS)
+    await context.add_init_script(STEALTH_SCRIPT)
+    page = await context.new_page()
+    return context, page
+
+
+async def _goto_safe(page, url, retries=3):
+    for attempt in range(retries):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            return True
+        except Exception as e:
+            log.warning(f"  Navigation attempt {attempt+1} failed: {e}")
+            if attempt == retries - 1:
+                return False
+            await asyncio.sleep(3)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Dự án (Project) crawler
+# ---------------------------------------------------------------------------
+async def _extract_project_cards(page: Page) -> list[dict]:
+    """Extract project cards from a project listing page."""
+    return await page.evaluate("""() => {
+        const results = [];
+        // Project cards use .js__prj-card or similar selectors
+        let cards = document.querySelectorAll('.js__card, .re__card-full, [class*="prj-card"], [data-tracking-id]');
+        if (cards.length === 0) cards = document.querySelectorAll('a[href*="/du-an-"]');
+
+        const seen = new Set();
+        for (const card of cards) {
+            const linkEl = card.querySelector('a[href*="/du-an-"], a[href*="-pj"]')
+                || (card.tagName === 'A' && card.href && card.href.includes('du-an') ? card : null);
+            const titleEl = card.querySelector('[class*="card-title"], h3, h2, .js__card-title')
+                || card.querySelector('a[href*="-pj"]');
+            const locEl = card.querySelector('[class*="card-location"], [class*="location"]');
+            const priceEl = card.querySelector('[class*="config-price"], [class*="price"]');
+            const areaEl = card.querySelector('[class*="config-area"], [class*="area"]');
+            const imgEl = card.querySelector('img[src*="batdongsan"], img[data-src]');
+            const statusEl = card.querySelector('[class*="status"], [class*="badge"]');
+
+            const href = linkEl ? (linkEl.getAttribute('href') || '') : '';
+            if (!href || seen.has(href) || !href.includes('pj') && !href.includes('du-an')) continue;
+            seen.add(href);
+
+            results.push({
+                ten_du_an: titleEl ? titleEl.innerText.trim() : null,
+                khu_vuc: locEl ? locEl.innerText.trim() : null,
+                gia: priceEl ? priceEl.innerText.trim() : null,
+                dien_tich: areaEl ? areaEl.innerText.trim() : null,
+                trang_thai: statusEl ? statusEl.innerText.trim() : null,
+                url: href,
+                hinh_anh: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null,
+            });
+        }
+        return results;
+    }""")
+
+
+async def _scrape_project_detail(page: Page, url: str) -> dict:
+    """Visit a project detail page and extract structured data."""
+    detail = {}
+    try:
+        log.info(f"  Visiting project detail: {url}")
+        await page.goto(url, wait_until="commit", timeout=30_000)
+        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        await asyncio.sleep(3)
+
+        detail = await page.evaluate("""() => {
+            const d = {};
+            // Project name
+            const nameEl = document.querySelector('.re__project-title, h1, [class*="project-title"]');
+            if (nameEl) d.ten_du_an = nameEl.innerText.trim();
+
+            // Spec items (key-value)
+            const specItems = document.querySelectorAll(
+                '.re__pr-specs-content-item, .re__prj-config-item, [class*="specs-content-item"], [class*="config-item"]'
+            );
+            for (const item of specItems) {
+                const k = item.querySelector('[class*="title"], .title, dt, th, label');
+                const v = item.querySelector('[class*="value"], .value, dd, td, span:last-child');
+                if (k && v) d[k.innerText.trim()] = v.innerText.trim();
+            }
+
+            // Short info
+            const shortItems = document.querySelectorAll('.re__pr-short-info-item, [class*="short-info-item"]');
+            for (const item of shortItems) {
+                const k = item.querySelector('.title');
+                const v = item.querySelector('.value');
+                if (k && v) d[k.innerText.trim()] = v.innerText.trim();
+            }
+
+            // Description
+            const descEl = document.querySelector(
+                '.re__detail-content .re__section-body, [class*="detail-content"] [class*="section-body"], .re__detail-content, .re__project-desc'
+            );
+            if (descEl) d._mo_ta_chi_tiet = descEl.innerText.trim().substring(0, 3000);
+
+            // Address
+            const addrEl = document.querySelector('.re__pr-short-description--address, [class*="address"]');
+            if (addrEl) d._dia_chi = addrEl.innerText.trim();
+
+            // Images
+            const imgs = [];
+            const imgEls = document.querySelectorAll('.re__media-thumb-item img, .slick-slide img, [class*="media"] img, img[src*="batdongsan"]');
+            for (const img of imgEls) {
+                const src = img.getAttribute('src') || img.getAttribute('data-src');
+                if (src && !imgs.includes(src) && !src.includes('data:image')) imgs.push(src);
+            }
+            d._hinh_anh = imgs;
+
+            // Amenities / utilities
+            const utils = [];
+            const utilEls = document.querySelectorAll('[class*="utility"] [class*="item"], [class*="tien-ich"] li');
+            for (const u of utilEls) utils.push(u.innerText.trim());
+            if (utils.length) d._tien_ich = utils;
+
+            return d;
+        }""")
+    except PwTimeout:
+        log.warning(f"  Timeout loading project detail: {url}")
+    except Exception as e:
+        log.warning(f"  Error loading project detail {url}: {e}")
+    return detail
+
+
+PROJECT_SPEC_MAP = {
+    "Chủ đầu tư": "chu_dau_tu",
+    "Quy mô": "quy_mo",
+    "Diện tích": "dien_tich",
+    "Mức giá": "gia",
+    "Giá": "gia",
+    "Loại hình": "loai_du_an",
+    "Pháp lý": "phap_ly",
+    "Trạng thái": "trang_thai",
+    "Số tòa": "so_toa",
+    "Số căn hộ": "so_can_ho",
+    "Năm bàn giao": "nam_ban_giao",
+    "Năm khởi công": "nam_khoi_cong",
+}
+
+
+def _merge_project(card: dict, detail: dict) -> dict:
+    record = {
+        "ten_du_an": card.get("ten_du_an"),
+        "loai_du_an": None,
+        "chu_dau_tu": None,
+        "khu_vuc": card.get("khu_vuc"),
+        "dia_chi": None,
+        "quy_mo": None,
+        "dien_tich": card.get("dien_tich"),
+        "gia": card.get("gia"),
+        "trang_thai": card.get("trang_thai"),
+        "phap_ly": None,
+        "so_toa": None,
+        "so_can_ho": None,
+        "nam_ban_giao": None,
+        "nam_khoi_cong": None,
+        "mo_ta_chi_tiet": None,
+        "tien_ich": [],
+        "url": card.get("url"),
+        "hinh_anh": [card["hinh_anh"]] if card.get("hinh_anh") else [],
+    }
+    if detail.get("ten_du_an"):
+        record["ten_du_an"] = detail["ten_du_an"]
+    for vn_key, field in PROJECT_SPEC_MAP.items():
+        if vn_key in detail:
+            record[field] = detail[vn_key]
+    if detail.get("_mo_ta_chi_tiet"):
+        record["mo_ta_chi_tiet"] = detail["_mo_ta_chi_tiet"]
+    if detail.get("_dia_chi"):
+        record["dia_chi"] = detail["_dia_chi"]
+    if detail.get("_hinh_anh"):
+        record["hinh_anh"] = detail["_hinh_anh"]
+    if detail.get("_tien_ich"):
+        record["tien_ich"] = detail["_tien_ich"]
+    # Infer loai_du_an from URL
+    if not record["loai_du_an"] and record.get("url"):
+        u = record["url"]
+        type_map = {
+            "can-ho-chung-cu": "Căn hộ chung cư", "cao-oc-van-phong": "Cao ốc văn phòng",
+            "trung-tam-thuong-mai": "Trung tâm thương mại", "khu-do-thi-moi": "Khu đô thị mới",
+            "khu-phuc-hop": "Khu phức hợp", "nha-o-xa-hoi": "Nhà ở xã hội",
+            "khu-nghi-duong": "Khu nghỉ dưỡng", "khu-cong-nghiep": "Khu công nghiệp",
+            "biet-thu-lien-ke": "Biệt thự, liền kề", "shophouse": "Shophouse",
+            "nha-mat-pho": "Nhà mặt phố",
+        }
+        for slug, name in type_map.items():
+            if slug in u:
+                record["loai_du_an"] = name
+                break
+    return record
+
+
+async def crawl_projects(max_pages: int = MAX_PAGES, visit_details: bool = True):
+    """Crawl project listings from batdongsan.com.vn/du-an-bat-dong-san."""
+    output_file = DATA_DIR / "projects.json"
+    log.info(f"Crawling projects from {PROJECT_URL}")
+    all_projects: list[dict] = []
+
+    async with async_playwright() as pw:
+        browser = await _launch_browser(pw)
+        for pg in range(1, max_pages + 1):
+            context, page = await _new_stealth_page(browser)
+            url = PROJECT_URL if pg == 1 else f"{PROJECT_URL}/p{pg}"
+            log.info(f"Navigating to project page {pg}: {url}")
+
+            if not await _goto_safe(page, url):
+                await context.close()
+                break
+            await asyncio.sleep(5)
+            await _wait_for_listings(page)
+            await asyncio.sleep(2)
+
+            cards = await _extract_project_cards(page)
+            if not cards:
+                log.warning(f"No project cards on page {pg}, stopping.")
+                await context.close()
+                break
+
+            for c in cards:
+                if c.get("url") and not c["url"].startswith("http"):
+                    c["url"] = BASE_URL + c["url"]
+
+            log.info(f"  Found {len(cards)} projects on page {pg}")
+
+            if visit_details:
+                for idx, card in enumerate(cards):
+                    if not card.get("url"):
+                        all_projects.append(_merge_project(card, {}))
+                        continue
+                    detail = await _scrape_project_detail(page, card["url"])
+                    all_projects.append(_merge_project(card, detail))
+                    if (idx + 1) % 5 == 0:
+                        log.info(f"  Progress: {idx+1}/{len(cards)} on page {pg}")
+                    await asyncio.sleep(REQUEST_DELAY)
+            else:
+                for card in cards:
+                    all_projects.append(_merge_project(card, {}))
+
+            log.info(f"  Total projects so far: {len(all_projects)}")
+            await context.close()
+            await asyncio.sleep(REQUEST_DELAY)
+        await browser.close()
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(all_projects, f, ensure_ascii=False, indent=2)
+    log.info(f"Saved {len(all_projects)} projects to {output_file}")
+    return all_projects
+
+
+# ---------------------------------------------------------------------------
+# Tin tức (News) & Wiki BĐS — article crawlers
+# ---------------------------------------------------------------------------
+async def _extract_article_cards(page: Page) -> list[dict]:
+    """Extract article cards from news/wiki listing page."""
+    return await page.evaluate("""() => {
+        const results = [];
+        const seen = new Set();
+        // Try multiple selectors for article cards
+        const cards = document.querySelectorAll(
+            '[class*="news-item"], [class*="wiki-item"], article, '
+            + '.re__card-full, .js__card, [data-tracking-id], '
+            + 'a[href*="/tin-tuc/"][href*="-"], a[href*="/wiki/"][href*="-"]'
+        );
+
+        for (const card of cards) {
+            let linkEl = card.querySelector('a[href*="/tin-tuc/"], a[href*="/wiki/"]');
+            if (!linkEl && card.tagName === 'A') linkEl = card;
+            if (!linkEl) continue;
+
+            const href = linkEl.getAttribute('href') || '';
+            // Filter: must be an article URL (contains digits at end = article ID)
+            if (!href || seen.has(href)) continue;
+            if (!(/\\d{4,}$/.test(href.replace(/\\/$/, '')))) continue;
+            seen.add(href);
+
+            const titleEl = card.querySelector('h2, h3, [class*="title"]') || linkEl;
+            const descEl = card.querySelector('[class*="description"], [class*="summary"], p');
+            const dateEl = card.querySelector('[class*="date"], [class*="time"], time');
+            const catEl = card.querySelector('[class*="category"], [class*="tag"]');
+            const imgEl = card.querySelector('img[src], img[data-src]');
+
+            results.push({
+                tieu_de: titleEl ? titleEl.innerText.trim() : null,
+                mo_ta: descEl ? descEl.innerText.trim() : null,
+                ngay_dang: dateEl ? dateEl.innerText.trim() : null,
+                danh_muc: catEl ? catEl.innerText.trim() : null,
+                url: href,
+                hinh_anh: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null,
+            });
+        }
+        return results;
+    }""")
+
+
+async def _scrape_article_detail(page: Page, url: str) -> dict:
+    """Visit an article detail page and extract content."""
+    detail = {}
+    try:
+        log.info(f"  Visiting article: {url}")
+        await page.goto(url, wait_until="commit", timeout=30_000)
+        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        await asyncio.sleep(3)
+
+        detail = await page.evaluate("""() => {
+            const d = {};
+            // Title
+            const titleEl = document.querySelector('h1, [class*="article-title"], [class*="post-title"]');
+            if (titleEl) d.tieu_de = titleEl.innerText.trim();
+
+            // Date
+            const dateEl = document.querySelector('[class*="date"], [class*="time"], time, [class*="publish"]');
+            if (dateEl) d.ngay_dang = dateEl.innerText.trim();
+
+            // Author
+            const authorEl = document.querySelector('[class*="author"], [class*="writer"], [class*="source"]');
+            if (authorEl) d.tac_gia = authorEl.innerText.trim();
+
+            // Category
+            const catEl = document.querySelector('[class*="breadcrumb"] a:nth-child(2), [class*="category"]');
+            if (catEl) d.danh_muc = catEl.innerText.trim();
+
+            // Full content
+            const bodyEl = document.querySelector(
+                '.re__detail-content, [class*="article-body"], [class*="post-content"], '
+                + '[class*="detail-content"], article .content, .re__section-body'
+            );
+            if (bodyEl) d.noi_dung = bodyEl.innerText.trim().substring(0, 5000);
+
+            // Images
+            const imgs = [];
+            const contentArea = bodyEl || document;
+            const imgEls = contentArea.querySelectorAll('img[src]');
+            for (const img of imgEls) {
+                const src = img.getAttribute('src') || img.getAttribute('data-src');
+                if (src && !imgs.includes(src) && !src.includes('data:image')
+                    && !src.includes('icon') && !src.includes('logo')) {
+                    imgs.push(src);
+                }
+            }
+            d.hinh_anh = imgs;
+
+            return d;
+        }""")
+    except PwTimeout:
+        log.warning(f"  Timeout loading article: {url}")
+    except Exception as e:
+        log.warning(f"  Error loading article {url}: {e}")
+    return detail
+
+
+def _merge_article(card: dict, detail: dict, section: str = "tin-tuc", category: str = None) -> dict:
+    record = {
+        "loai": section,
+        "danh_muc": category or card.get("danh_muc"),
+        "tieu_de": detail.get("tieu_de") or card.get("tieu_de"),
+        "mo_ta": card.get("mo_ta"),
+        "noi_dung": detail.get("noi_dung"),
+        "tac_gia": detail.get("tac_gia"),
+        "ngay_dang": detail.get("ngay_dang") or card.get("ngay_dang"),
+        "url": card.get("url"),
+        "hinh_anh": detail.get("hinh_anh") or ([card["hinh_anh"]] if card.get("hinh_anh") else []),
+    }
+    if detail.get("danh_muc") and not record["danh_muc"]:
+        record["danh_muc"] = detail["danh_muc"]
+    return record
+
+
+async def _crawl_articles(
+    section_url: str,
+    section_name: str,
+    output_file: Path,
+    max_pages: int = MAX_PAGES,
+    visit_details: bool = True,
+    category: str = None,
+):
+    """Generic article crawler used by both news and wiki."""
+    log.info(f"Crawling {section_name} from {section_url}")
+    all_articles: list[dict] = []
+
+    async with async_playwright() as pw:
+        browser = await _launch_browser(pw)
+        for pg in range(1, max_pages + 1):
+            context, page = await _new_stealth_page(browser)
+            url = section_url if pg == 1 else f"{section_url}/p{pg}"
+            log.info(f"Navigating to {section_name} page {pg}: {url}")
+
+            if not await _goto_safe(page, url):
+                await context.close()
+                break
+            await asyncio.sleep(5)
+
+            # Scroll to trigger lazy load
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            await asyncio.sleep(2)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
+
+            cards = await _extract_article_cards(page)
+            if not cards:
+                log.warning(f"No article cards on {section_name} page {pg}, stopping.")
+                await context.close()
+                break
+
+            for c in cards:
+                if c.get("url") and not c["url"].startswith("http"):
+                    c["url"] = BASE_URL + c["url"]
+
+            log.info(f"  Found {len(cards)} articles on page {pg}")
+
+            if visit_details:
+                for idx, card in enumerate(cards):
+                    if not card.get("url"):
+                        all_articles.append(_merge_article(card, {}, section_name, category))
+                        continue
+                    detail = await _scrape_article_detail(page, card["url"])
+                    all_articles.append(_merge_article(card, detail, section_name, category))
+                    if (idx + 1) % 5 == 0:
+                        log.info(f"  Progress: {idx+1}/{len(cards)} on page {pg}")
+                    await asyncio.sleep(REQUEST_DELAY)
+            else:
+                for card in cards:
+                    all_articles.append(_merge_article(card, {}, section_name, category))
+
+            log.info(f"  Total articles so far: {len(all_articles)}")
+            await context.close()
+            await asyncio.sleep(REQUEST_DELAY)
+        await browser.close()
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(all_articles, f, ensure_ascii=False, indent=2)
+    log.info(f"Saved {len(all_articles)} articles to {output_file}")
+    return all_articles
+
+
+async def crawl_news(max_pages: int = MAX_PAGES, visit_details: bool = True):
+    """Crawl news articles from /tin-tuc."""
+    return await _crawl_articles(
+        section_url=NEWS_URL,
+        section_name="tin-tuc",
+        output_file=DATA_DIR / "news.json",
+        max_pages=max_pages,
+        visit_details=visit_details,
+        category="Tin tức",
+    )
+
+
+async def crawl_wiki(
+    max_pages: int = MAX_PAGES,
+    visit_details: bool = True,
+    wiki_category: str = None,
+):
+    """
+    Crawl wiki articles from /wiki.
+    If wiki_category is specified (e.g. 'mua-bds'), crawl only that sub-category.
+    Otherwise crawl all sub-categories.
+    """
+    if wiki_category:
+        cats = {wiki_category: WIKI_CATEGORIES.get(wiki_category, wiki_category)}
+    else:
+        cats = WIKI_CATEGORIES
+
+    all_wiki: list[dict] = []
+    for slug, name in cats.items():
+        section_url = f"{WIKI_URL}/{slug}"
+        out_file = DATA_DIR / f"wiki_{slug.replace('-', '_')}.json"
+        articles = await _crawl_articles(
+            section_url=section_url,
+            section_name="wiki",
+            output_file=out_file,
+            max_pages=max_pages,
+            visit_details=visit_details,
+            category=name,
+        )
+        all_wiki.extend(articles)
+
+    # Also save a combined file
+    combined = DATA_DIR / "wiki_all.json"
+    combined.parent.mkdir(parents=True, exist_ok=True)
+    with open(combined, "w", encoding="utf-8") as f:
+        json.dump(all_wiki, f, ensure_ascii=False, indent=2)
+    log.info(f"Saved {len(all_wiki)} total wiki articles to {combined}")
+    return all_wiki
+
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
     lt = sys.argv[1] if len(sys.argv) > 1 else "ban"
-    asyncio.run(crawl(listing_type=lt))
+    if lt == "du-an":
+        asyncio.run(crawl_projects())
+    elif lt == "tin-tuc":
+        asyncio.run(crawl_news())
+    elif lt == "wiki":
+        asyncio.run(crawl_wiki())
+    else:
+        asyncio.run(crawl(listing_type=lt))
