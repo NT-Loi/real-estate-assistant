@@ -63,7 +63,7 @@ WIKI_CATEGORIES = {
     "phong-tuc": "Phong tục",
 }
 
-MAX_PAGES = 3  # Number of listing pages to crawl (change as needed)
+MAX_PAGES = 1  # Number of listing pages to crawl (change as needed)
 DATA_DIR = Path(__file__).parent / "data"
 REQUEST_DELAY = 2.0  # Seconds between page navigations (be polite)
 
@@ -671,21 +671,35 @@ async def _scrape_project_detail(page: Page, url: str) -> dict:
 
         detail = await page.evaluate("""() => {
             const d = {};
-            // Project name
-            const nameEl = document.querySelector('.re__project-title, h1, [class*="project-title"]');
-            if (nameEl) d.ten_du_an = nameEl.innerText.trim();
-
-            // Spec items (key-value)
-            const specItems = document.querySelectorAll(
-                '.re__pr-specs-content-item, .re__prj-config-item, [class*="specs-content-item"], [class*="config-item"]'
-            );
-            for (const item of specItems) {
-                const k = item.querySelector('[class*="title"], .title, dt, th, label');
-                const v = item.querySelector('[class*="value"], .value, dd, td, span:last-child');
-                if (k && v) d[k.innerText.trim()] = v.innerText.trim();
+            // Project name — actual class is re__project-name
+            const nameEl = document.querySelector('h1.re__project-name, .re__project-name, h1');
+            if (nameEl) {
+                const txt = nameEl.innerText.trim();
+                // Skip if it's just the site name
+                if (txt && txt !== 'batdongsan.com.vn') d.ten_du_an = txt;
             }
 
-            // Short info
+            // Status — actual class is re__prj-tag-info
+            const statusEl = document.querySelector('.re__prj-tag-info');
+            if (statusEl) d['Trạng thái'] = statusEl.innerText.trim();
+
+            // Spec box items (key-value pairs as "title\\nvalue")
+            const boxItems = document.querySelectorAll('.re__project-box-item');
+            for (const item of boxItems) {
+                const parts = item.innerText.trim().split('\\n');
+                if (parts.length >= 2) d[parts[0].trim()] = parts[1].trim();
+            }
+
+            // Spec table rows
+            const specRows = document.querySelectorAll('tbody.re__project-attr tr, .re__pr-specs-content-item');
+            for (const row of specRows) {
+                const cells = row.querySelectorAll('td, th, [class*="title"], [class*="value"]');
+                if (cells.length >= 2) {
+                    d[cells[0].innerText.trim()] = cells[1].innerText.trim();
+                }
+            }
+
+            // Short info items
             const shortItems = document.querySelectorAll('.re__pr-short-info-item, [class*="short-info-item"]');
             for (const item of shortItems) {
                 const k = item.querySelector('.title');
@@ -693,29 +707,46 @@ async def _scrape_project_detail(page: Page, url: str) -> dict:
                 if (k && v) d[k.innerText.trim()] = v.innerText.trim();
             }
 
-            // Description
+            // Config items
+            const cfgItems = document.querySelectorAll('.re__prj-config-item, [class*="config-item"]');
+            for (const item of cfgItems) {
+                const k = item.querySelector('[class*="title"], .title, label');
+                const v = item.querySelector('[class*="value"], .value');
+                if (k && v) d[k.innerText.trim()] = v.innerText.trim();
+            }
+
+            // Description — actual class is js__prj-detail-content / re__project-editor
             const descEl = document.querySelector(
-                '.re__detail-content .re__section-body, [class*="detail-content"] [class*="section-body"], .re__detail-content, .re__project-desc'
+                '.js__prj-detail-content, .re__project-editor, .re__detail-content, .re__project-desc'
             );
             if (descEl) d._mo_ta_chi_tiet = descEl.innerText.trim().substring(0, 3000);
 
-            // Address
-            const addrEl = document.querySelector('.re__pr-short-description--address, [class*="address"]');
+            // Address — actual class is re__project-address
+            const addrEl = document.querySelector('.re__project-address, .re__pr-short-description--address');
             if (addrEl) d._dia_chi = addrEl.innerText.trim();
 
-            // Images
+            // Images — filter out site chrome
             const imgs = [];
-            const imgEls = document.querySelectorAll('.re__media-thumb-item img, .slick-slide img, [class*="media"] img, img[src*="batdongsan"]');
+            const imgEls = document.querySelectorAll(
+                '.re__project-album img, .re__media-thumb-item img, .slick-slide img, img[src*="file4.batdongsan"], img[src*="file1.batdongsan"]'
+            );
             for (const img of imgEls) {
                 const src = img.getAttribute('src') || img.getAttribute('data-src');
-                if (src && !imgs.includes(src) && !src.includes('data:image')) imgs.push(src);
+                if (src && !imgs.includes(src) && !src.includes('data:image')
+                    && !src.includes('mobileSearch') && !src.includes('google-play')
+                    && !src.includes('app_store') && !src.includes('footer')) imgs.push(src);
             }
             d._hinh_anh = imgs;
 
             // Amenities / utilities
             const utils = [];
-            const utilEls = document.querySelectorAll('[class*="utility"] [class*="item"], [class*="tien-ich"] li');
-            for (const u of utilEls) utils.push(u.innerText.trim());
+            const utilEls = document.querySelectorAll(
+                '.re__prj-facilities [class*="item"], [class*="utility"] [class*="item"], [class*="tien-ich"] li'
+            );
+            for (const u of utilEls) {
+                const t = u.innerText.trim();
+                if (t && !utils.includes(t)) utils.push(t);
+            }
             if (utils.length) d._tien_ich = utils;
 
             return d;
@@ -740,12 +771,34 @@ PROJECT_SPEC_MAP = {
     "Số căn hộ": "so_can_ho",
     "Năm bàn giao": "nam_ban_giao",
     "Năm khởi công": "nam_khoi_cong",
+    "Mật độ xây dựng": "mat_do_xay_dung",
 }
 
 
+def _infer_project_name_from_url(url: str) -> Optional[str]:
+    """Extract a readable project name from the URL slug (last path segment before pjNNNN)."""
+    if not url:
+        return None
+    m = re.search(r'/([^/]+)-pj\d+', url)
+    if m:
+        slug = m.group(1)
+        # Convert slug to title case: "fecon-ip-hiep-hoa" → "Fecon Ip Hiep Hoa"
+        return slug.replace('-', ' ').title()
+    return None
+
+
 def _merge_project(card: dict, detail: dict) -> dict:
+    # Determine project name: detail > card (if not junk) > infer from URL
+    ten_du_an = detail.get("ten_du_an")
+    if not ten_du_an:
+        card_name = card.get("ten_du_an")
+        if card_name and card_name != "batdongsan.com.vn":
+            ten_du_an = card_name
+    if not ten_du_an:
+        ten_du_an = _infer_project_name_from_url(card.get("url"))
+
     record = {
-        "ten_du_an": card.get("ten_du_an"),
+        "ten_du_an": ten_du_an,
         "loai_du_an": None,
         "chu_dau_tu": None,
         "khu_vuc": card.get("khu_vuc"),
@@ -759,13 +812,12 @@ def _merge_project(card: dict, detail: dict) -> dict:
         "so_can_ho": None,
         "nam_ban_giao": None,
         "nam_khoi_cong": None,
+        "mat_do_xay_dung": None,
         "mo_ta_chi_tiet": None,
         "tien_ich": [],
         "url": card.get("url"),
         "hinh_anh": [card["hinh_anh"]] if card.get("hinh_anh") else [],
     }
-    if detail.get("ten_du_an"):
-        record["ten_du_an"] = detail["ten_du_an"]
     for vn_key, field in PROJECT_SPEC_MAP.items():
         if vn_key in detail:
             record[field] = detail[vn_key]
@@ -907,41 +959,78 @@ async def _scrape_article_detail(page: Page, url: str) -> dict:
         await page.wait_for_load_state("domcontentloaded", timeout=15_000)
         await asyncio.sleep(3)
 
-        detail = await page.evaluate("""() => {
+        detail = await page.evaluate(r"""() => {
             const d = {};
             // Title
-            const titleEl = document.querySelector('h1, [class*="article-title"], [class*="post-title"]');
+            const titleEl = document.querySelector('h1');
             if (titleEl) d.tieu_de = titleEl.innerText.trim();
 
-            // Date
-            const dateEl = document.querySelector('[class*="date"], [class*="time"], time, [class*="publish"]');
-            if (dateEl) d.ngay_dang = dateEl.innerText.trim();
+            // Description from meta OG tag
+            const ogDesc = document.querySelector('meta[property="og:description"]');
+            if (ogDesc) d.mo_ta = ogDesc.getAttribute('content');
 
-            // Author
-            const authorEl = document.querySelector('[class*="author"], [class*="writer"], [class*="source"]');
-            if (authorEl) d.tac_gia = authorEl.innerText.trim();
+            // Author — try author link, but verify it has text
+            const authorLink = document.querySelector('a[href*="/tac-gia/"]');
+            const authorLinkText = authorLink ? authorLink.innerText.trim() : '';
+            if (authorLinkText) {
+                d.tac_gia = authorLinkText;
+            }
+            // Fallback: grab the full author area block (will be parsed in Python)
+            if (!d.tac_gia) {
+                const authorEl = document.querySelector('[class*="author"]');
+                if (authorEl) d.tac_gia = authorEl.innerText.trim();
+            }
 
-            // Category
-            const catEl = document.querySelector('[class*="breadcrumb"] a:nth-child(2), [class*="category"]');
-            if (catEl) d.danh_muc = catEl.innerText.trim();
+            // Date — extract from author area text
+            const authorArea = document.querySelector('[class*="author"], [class*="post-meta"]');
+            if (authorArea) {
+                const text = authorArea.innerText || '';
+                const dateMatch = text.match(/(\d{2}\/\d{2}\/\d{4}(?:\s+\d{2}:\d{2})?)/);
+                if (dateMatch) d.ngay_dang = dateMatch[1];
+            }
+            if (!d.ngay_dang) {
+                const timeEl = document.querySelector('time[datetime]');
+                if (timeEl) d.ngay_dang = timeEl.getAttribute('datetime') || timeEl.innerText.trim();
+            }
 
-            // Full content
-            const bodyEl = document.querySelector(
-                '.re__detail-content, [class*="article-body"], [class*="post-content"], '
-                + '[class*="detail-content"], article .content, .re__section-body'
-            );
+            // Category from breadcrumb
+            const bcLinks = document.querySelectorAll('.re__breadcrumb a, [class*="breadcrumb"] a');
+            if (bcLinks.length >= 2) d.danh_muc = bcLinks[bcLinks.length - 1].innerText.trim();
+
+            // Full content — try multiple selectors (article/main work on wiki subdomain)
+            const contentSelectors = [
+                '.re__detail-content .js__section-body',
+                '.js__section-body',
+                '.re__detail-content.re__project-editor',
+                '.re__project-editor',
+                '.re__detail-content',
+                '.re__section-body',
+                'article',
+                'main',
+                '[class*="article-body"]',
+                '[class*="post-content"]',
+            ];
+            let bodyEl = null;
+            for (const sel of contentSelectors) {
+                bodyEl = document.querySelector(sel);
+                if (bodyEl && bodyEl.innerText.trim().length > 50) break;
+            }
             if (bodyEl) d.noi_dung = bodyEl.innerText.trim().substring(0, 5000);
 
-            // Images
+            // Images — filter junk site-chrome images
+            const junkPatterns = [
+                'mobileSearch', 'authorDefault', 'google-play', 'app_store',
+                'footer', 'logo', 'icon', 'avatar', 'placeholder',
+                'staticfile.batdongsan.com.vn', 'cdn-assets-angel'
+            ];
             const imgs = [];
-            const contentArea = bodyEl || document;
-            const imgEls = contentArea.querySelectorAll('img[src]');
+            const imgArea = bodyEl || document;
+            const imgEls = imgArea.querySelectorAll('img[src]');
             for (const img of imgEls) {
                 const src = img.getAttribute('src') || img.getAttribute('data-src');
-                if (src && !imgs.includes(src) && !src.includes('data:image')
-                    && !src.includes('icon') && !src.includes('logo')) {
-                    imgs.push(src);
-                }
+                if (!src || src.includes('data:image')) continue;
+                const isJunk = junkPatterns.some(p => src.includes(p));
+                if (!isJunk && !imgs.includes(src)) imgs.push(src);
             }
             d.hinh_anh = imgs;
 
@@ -954,17 +1043,81 @@ async def _scrape_article_detail(page: Page, url: str) -> dict:
     return detail
 
 
+_IMAGE_JUNK_PATTERNS = [
+    "mobileSearch", "authorDefault", "google-play", "app_store",
+    "footer", "logo", "icon", "avatar", "placeholder",
+    "staticfile.batdongsan.com.vn/images", "cdn-assets-angel",
+]
+
+
+def _filter_images(imgs: list) -> list:
+    """Remove junk site-chrome images from a list of URLs."""
+    filtered = []
+    for src in imgs:
+        if not src:
+            continue
+        if any(p in src for p in _IMAGE_JUNK_PATTERNS):
+            continue
+        if src not in filtered:
+            filtered.append(src)
+    return filtered
+
+
+def _parse_author_block(raw: str):
+    """Parse combined author block like 'Được đăng bởi X\\nCập nhật ... dd/mm/yyyy HH:MM ...'
+    Returns (author_name, date_str)."""
+    author = None
+    date_str = None
+    if not raw:
+        return author, date_str
+
+    # Extract author name: "Được đăng bởi <name>"
+    m = re.search(r"Được đăng bởi\s+(.+?)(?:\n|$)", raw)
+    if m:
+        author = m.group(1).strip()
+    else:
+        # If the string is just a name (no "Được đăng bởi" prefix)
+        lines = raw.strip().split("\n")
+        if lines and len(lines[0]) < 50:
+            author = lines[0].strip()
+
+    # Extract date: dd/mm/yyyy or dd/mm/yyyy HH:MM
+    m = re.search(r"(\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2})?)", raw)
+    if m:
+        date_str = m.group(1)
+
+    return author, date_str
+
+
 def _merge_article(card: dict, detail: dict, section: str = "tin-tuc", category: str = None) -> dict:
+    # Get mo_ta: prefer detail's OG description, then card's
+    mo_ta = detail.get("mo_ta") or card.get("mo_ta")
+
+    # Get tac_gia and ngay_dang — parse from combined string if needed
+    tac_gia = detail.get("tac_gia")
+    ngay_dang = detail.get("ngay_dang") or card.get("ngay_dang")
+
+    # If tac_gia looks like a combined block, parse it
+    if tac_gia and ("Được đăng bởi" in tac_gia or "Cập nhật" in tac_gia):
+        parsed_author, parsed_date = _parse_author_block(tac_gia)
+        tac_gia = parsed_author
+        if not ngay_dang and parsed_date:
+            ngay_dang = parsed_date
+
+    # Build images list and filter junk
+    imgs = detail.get("hinh_anh") or ([card["hinh_anh"]] if card.get("hinh_anh") else [])
+    imgs = _filter_images(imgs)
+
     record = {
         "loai": section,
         "danh_muc": category or card.get("danh_muc"),
         "tieu_de": detail.get("tieu_de") or card.get("tieu_de"),
-        "mo_ta": card.get("mo_ta"),
+        "mo_ta": mo_ta,
         "noi_dung": detail.get("noi_dung"),
-        "tac_gia": detail.get("tac_gia"),
-        "ngay_dang": detail.get("ngay_dang") or card.get("ngay_dang"),
+        "tac_gia": tac_gia,
+        "ngay_dang": ngay_dang,
         "url": card.get("url"),
-        "hinh_anh": detail.get("hinh_anh") or ([card["hinh_anh"]] if card.get("hinh_anh") else []),
+        "hinh_anh": imgs,
     }
     if detail.get("danh_muc") and not record["danh_muc"]:
         record["danh_muc"] = detail["danh_muc"]
@@ -1098,6 +1251,6 @@ if __name__ == "__main__":
     elif lt == "tin-tuc":
         asyncio.run(crawl_news())
     elif lt == "wiki":
-        asyncio.run(crawl_wiki())
+        asyncio.run(crawl_wiki(wiki_category="mua-bds"))
     else:
         asyncio.run(crawl(listing_type=lt))
