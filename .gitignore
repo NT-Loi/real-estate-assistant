@@ -11,8 +11,7 @@ scripts
 db_data
 .agents
 .codex
-rag
-db
-db_data
+# rag
+# db
 *.ipynb
 *.pptx
