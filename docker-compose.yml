@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.5-alpine
+    container_name: real_estate_postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=real_estate
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db_data/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d real_estate"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: real_estate_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./db_data/qdrant:/qdrant/storage
+    restart: unless-stopped

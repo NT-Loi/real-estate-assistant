@@ -4,3 +4,15 @@ __pycache__
 .vscode
 chroma_data
 db
+docs
+rag
+scratch
+scripts
+db_data
+.agents
+.codex
+rag
+db
+db_data
+*.ipynb
+*.pptx
