@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EstateLux RAG Map Assistant</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="chat-panel" aria-label="RAG chatbot">
+        <header class="chat-top">
+          <div>
+            <p>EstateLux</p>
+            <h1>RAG Property Assistant</h1>
+          </div>
+          <span class="status">RAG ready</span>
+        </header>
+
+        <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
+
+        <form class="chat-form" id="chatForm">
+          <input
+            id="chatInput"
+            type="text"
+            placeholder="Ask about budget, location, family needs, investment..."
+            autocomplete="off"
+          />
+          <button type="submit">Send</button>
+        </form>
+      </section>
+
+      <section class="map-panel" aria-label="Property map">
+        <div id="map"></div>
+        <div class="map-overlay">
+          <strong id="activePropertyTitle">Select a marker</strong>
+          <span id="activePropertyMeta">Properties are marked on the map</span>
+        </div>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="rag/context.sample.js"></script>
+    <script src="script.js"></script>
+  </body>
+</html>
