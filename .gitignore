@@ -2,7 +2,7 @@
 data
 __pycache__
 .vscode
-chroma_data
+.env
 db
 docs
 rag
@@ -11,7 +11,5 @@ scripts
 db_data
 .agents
 .codex
-# rag
-# db
 *.ipynb
 *.pptx

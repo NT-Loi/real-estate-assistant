@@ -6,6 +6,27 @@ ROOT_DIR = Path(__file__).parent.parent
 DATA_DIR = ROOT_DIR / "data"
 LAW_DIR = DATA_DIR / "laws"
 
+
+def load_dotenv(path: Path = ROOT_DIR / ".env") -> None:
+    """Load simple KEY=VALUE pairs from .env without overriding exported env vars."""
+    if not path.exists():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+load_dotenv()
+
 # --- batdongsan.com.vn Configurations ---
 BASE_URL = "https://batdongsan.com.vn"
 LISTING_URLS = {

@@ -9,7 +9,7 @@ from crawlers.neighborhood.voz import VozCrawler
 from crawlers.neighborhood.google_reviews import GoogleReviewsCrawler
 
 from crawlers.dynamic.google_maps_poi import GoogleMapsPOI
-from crawlers.law.thuvienphapluat import LawCrawler
+from crawlers.dynamic.osm_poi import OSMPOI
 
 __all__ = [
     "ListingCrawler",
@@ -21,5 +21,5 @@ __all__ = [
     "VozCrawler",
     "GoogleReviewsCrawler",
     "GoogleMapsPOI",
-    "LawCrawler",
+    "OSMPOI",
 ]

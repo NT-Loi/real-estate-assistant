@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,14 @@ from crawlers.browser import launch_browser, new_stealth_page
 from crawlers.config import DATA_DIR, TIKTOK_COOKIES_FILE
 
 log = logging.getLogger("bds_crawler.tiktok")
+
+TIKTOK_KEYWORD_STOPWORDS = {
+    "review", "danh", "gia", "cho", "thue", "ban", "nha", "dat", "can", "ho", "chung", "cu",
+    "duong", "phuong", "quan", "huyen", "thanh", "pho", "tinh", "tp", "xa", "thi", "tran",
+    "khu", "do", "moi", "toa", "so", "cua", "tai", "gan", "nam", "bac", "dong", "tay",
+    "viet", "vietnam", "cu", "moi", "cuu", "va", "the", "city", "residence", "garden",
+    "complex", "apartment", "project", "hot", "full", "view",
+}
 
 class TikTokCrawler(BaseCrawler):
     """Crawler for collecting qualitative comments and video insights from TikTok using the cookies approach."""
@@ -252,6 +261,45 @@ class TikTokCrawler(BaseCrawler):
             self.log.warning(f"yt-dlp metadata extraction failed for {video_url}: {e}")
         return {}
 
+    @staticmethod
+    def _normalize_text(text: object) -> str:
+        raw = str(text or "").lower()
+        decomposed = unicodedata.normalize("NFD", raw)
+        no_accents = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+        return re.sub(r"[^a-z0-9]+", " ", no_accents).strip()
+
+    @classmethod
+    def _keyword_terms(cls, keyword: str) -> List[str]:
+        normalized = cls._normalize_text(keyword)
+        terms = []
+        for token in normalized.split():
+            if len(token) < 3 or token in TIKTOK_KEYWORD_STOPWORDS:
+                continue
+            if token not in terms:
+                terms.append(token)
+        return terms
+
+    @classmethod
+    def is_relevant_to_keyword(cls, keyword: Optional[str], *texts: object) -> bool:
+        """Keep only videos whose visible metadata overlaps with distinctive keyword terms."""
+        if not keyword:
+            return True
+
+        terms = cls._keyword_terms(keyword)
+        if not terms:
+            return True
+
+        haystack = cls._normalize_text(" ".join(str(t or "") for t in texts))
+        if not haystack:
+            return False
+
+        matched = [term for term in terms if term in haystack]
+        if len(matched) >= 2:
+            return True
+
+        # Allow a strong single match for distinctive project/brand-like tokens.
+        return any(len(term) >= 6 for term in matched)
+
     async def search_videos_by_keyword(self, keyword: str, max_results: int = 10) -> List[Dict[str, Any]]:
         """Search TikTok for videos matching a keyword using Playwright stealth browser.
         
@@ -259,7 +307,7 @@ class TikTokCrawler(BaseCrawler):
         """
         self.log.info(f"Searching TikTok for: '{keyword}'")
         encoded_kw = urllib.parse.quote(keyword)
-        search_url = f"https://www.tiktok.com/search?q={encoded_kw}"
+        search_url = f"https://www.tiktok.com/search/video?q={encoded_kw}"
         found_videos = []
 
         try:
@@ -275,58 +323,71 @@ class TikTokCrawler(BaseCrawler):
 
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
                 # Let search results render (TikTok is SPA-heavy)
-                await asyncio.sleep(8)
+                try:
+                    await page.wait_for_selector('a[href*="/video/"]', timeout=20_000)
+                except Exception:
+                    self.log.warning(f"No TikTok video links became visible for keyword '{keyword}'")
+                await asyncio.sleep(4)
 
                 # Scroll down a couple times to load more results
                 for _ in range(3):
                     await page.evaluate("window.scrollBy(0, 1000)")
                     await asyncio.sleep(2)
 
-                html = await page.content()
+                found_videos = await page.evaluate(
+                    """({ keyword, maxResults }) => {
+                        const isVisible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 20 && rect.height > 20 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+
+                        const textFor = (el) => {
+                            let cur = el;
+                            let best = '';
+                            for (let i = 0; i < 8 && cur; i += 1) {
+                                const txt = (cur.innerText || '').replace(/\\s+/g, ' ').trim();
+                                if (txt.length > best.length && txt.length < 800) best = txt;
+                                cur = cur.parentElement;
+                            }
+                            return best;
+                        };
+
+                        const main = document.querySelector('main') || document.body;
+                        const anchors = Array.from(main.querySelectorAll('a[href*="/video/"]'));
+                        const rows = [];
+                        const seen = new Set();
+
+                        for (const a of anchors) {
+                            if (!isVisible(a)) continue;
+                            const hrefRaw = a.getAttribute('href') || '';
+                            let href = hrefRaw.startsWith('http') ? hrefRaw : new URL(hrefRaw, window.location.origin).toString();
+                            const match = href.match(/\\/video\\/(\\d+)/);
+                            if (!match) continue;
+
+                            const videoId = match[1];
+                            if (seen.has(videoId)) continue;
+                            seen.add(videoId);
+
+                            const rect = a.getBoundingClientRect();
+                            const title = textFor(a);
+                            const authorMatch = href.match(/tiktok\\.com\\/(@[^/]+)\\/video\\//);
+                            rows.push({
+                                url: href.split('?')[0],
+                                video_id: videoId,
+                                title: title || null,
+                                author: authorMatch ? authorMatch[1] : null,
+                                keyword,
+                                top: rect.top,
+                                left: rect.left,
+                            });
+                            if (rows.length >= maxResults) break;
+                        }
+                        return rows;
+                    }""",
+                    {"keyword": keyword, "maxResults": max_results},
+                )
                 await browser.close()
-
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-
-            # Strategy 1: Find video links matching TikTok video URL pattern
-            seen_urls = set()
-            video_links = soup.find_all("a", href=re.compile(r"/@[^/]+/video/\d+"))
-            for a in video_links:
-                href = a["href"]
-                # Normalize to full URL
-                if href.startswith("/"):
-                    href = "https://www.tiktok.com" + href
-                # Deduplicate
-                vid_match = re.search(r"/video/(\d+)", href)
-                if not vid_match:
-                    continue
-                vid_id = vid_match.group(1)
-                if vid_id in seen_urls:
-                    continue
-                seen_urls.add(vid_id)
-
-                # Try to extract text context from nearby elements
-                title_text = a.get_text(strip=True) or ""
-                # Walk up to find a card container for more context
-                parent = a.parent
-                for _ in range(5):
-                    if parent is None:
-                        break
-                    candidate = parent.get_text(separator=" ", strip=True)
-                    if len(candidate) > len(title_text) and len(candidate) < 500:
-                        title_text = candidate
-                    parent = parent.parent
-
-                found_videos.append({
-                    "url": href,
-                    "video_id": vid_id,
-                    "title": title_text[:300] if title_text else None,
-                    "author": None,  # Will be enriched via oEmbed later
-                    "keyword": keyword,
-                })
-
-                if len(found_videos) >= max_results:
-                    break
 
             self.log.info(f"Found {len(found_videos)} TikTok videos for keyword '{keyword}'")
         except Exception as e:
@@ -422,6 +483,23 @@ class TikTokCrawler(BaseCrawler):
             # Fetch extra metadata via yt-dlp
             yt_info = self.fetch_video_metadata_with_yt_dlp(url)
 
+            title_candidates = [
+                item.get("title"),
+                title,
+                yt_info.get("title"),
+                yt_info.get("description"),
+                author,
+                yt_info.get("uploader"),
+            ]
+            if kw and not self.is_relevant_to_keyword(kw, *title_candidates):
+                self.log.info(
+                    "Skipping unrelated TikTok result for keyword '%s': %s",
+                    kw,
+                    title or yt_info.get("title") or item.get("title") or url,
+                )
+                processed_ids.add(aweme_id)
+                continue
+
             # Fetch comments using the cookie REST API
             comments_data = self.fetch_comments_with_replies(aweme_id, max_comments=max_comments_per_video)
 
@@ -453,4 +531,3 @@ class TikTokCrawler(BaseCrawler):
 
         self.save_final_results(all_results, resume)
         return all_results
-
