@@ -275,7 +275,6 @@ async def run_crawlers_async(args):
                 kw_list = gen_kws + kw_list if kw_list else gen_kws
         return kw_list
 
-    kw_list = resolve_keywords()
     url_list = [u.strip() for u in args.urls.split(",") if u.strip()]
 
     # 1. Properties (For Sale / Rent)
@@ -306,14 +305,16 @@ async def run_crawlers_async(args):
     # 5. YouTube Comments & Transcripts
     elif args.type == "youtube":
         crawler = YouTubeCrawler()
-        await crawler.crawl(keywords=resolve_keywords(), max_videos_per_kw=args.pages, max_comments_per_video=50, resume=args.resume)
+        review_keywords = resolve_keywords()
+        await crawler.crawl(keywords=review_keywords, max_videos_per_kw=args.pages, max_comments_per_video=50, resume=args.resume)
  
     # 6. TikTok Comments (keyword search + direct URLs)
     elif args.type == "tiktok":
         crawler = TikTokCrawler()
+        review_keywords = resolve_keywords()
         await crawler.crawl(
             urls=url_list if url_list else None,
-            keywords=resolve_keywords() if resolve_keywords() else None,
+            keywords=review_keywords if review_keywords else None,
             max_videos_per_kw=args.pages,
             max_comments_per_video=50,
             resume=args.resume
@@ -322,8 +323,9 @@ async def run_crawlers_async(args):
     # 7. VOZ Forum Discussions (keyword search or forum browse)
     elif args.type == "voz":
         crawler = VozCrawler()
+        review_keywords = resolve_keywords()
         await crawler.crawl(
-            keywords=resolve_keywords() if resolve_keywords() else None,
+            keywords=review_keywords if review_keywords else None,
             max_pages=args.pages,
             max_threads_per_page=args.pages * 3,
             max_threads_per_kw=args.pages * 3,
@@ -337,7 +339,7 @@ async def run_crawlers_async(args):
             log.error("google-reviews requires GOOGLE_MAPS_API_KEY. Use VOZ/TikTok/YouTube for key-free social signals.")
             return
         crawler = GoogleReviewsCrawler()
-        await crawler.crawl(queries=kw_list, resume=args.resume)
+        await crawler.crawl(queries=resolve_keywords(), resume=args.resume)
 
     # 9. POIs (OSM by default, Google only when the key is explicitly configured)
     elif args.type in ("poi", "osm-poi"):
