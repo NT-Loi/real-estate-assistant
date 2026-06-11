@@ -85,10 +85,16 @@ When `--keywords` is omitted, review crawlers generate search keywords from craw
 Commands:
 
 ```bash
-python run.py --type youtube --pages 3
-python run.py --type tiktok --pages 3
+python run.py --type youtube
+python run.py --type tiktok
 python run.py --type voz --pages 3
 ```
+
+Default review limits:
+
+- YouTube: 20 videos per keyword, up to 50 comments per video.
+- TikTok: 20 videos per keyword, up to 50 comments per video.
+- VOZ: 20 threads per keyword, across `--pages` search pages.
 
 Outputs:
 
