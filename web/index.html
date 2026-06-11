@@ -1,4 +1,5 @@
 <!doctype html>
+<<<<<<< HEAD
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -46,5 +47,117 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="rag/context.sample.js"></script>
     <script src="script.js"></script>
+=======
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Real Estate Assistant</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="left-panel">
+        <section class="chat-panel" aria-label="Trợ lý chat">
+          <header class="chat-header">
+            <div>
+              <h1>Real Estate Assistant</h1>
+              <p>Ask in Vietnamese. The answer uses RAG sources and listing evidence.</p>
+            </div>
+            <span id="ragStatus" class="status-pill">RAG</span>
+          </header>
+
+          <div id="suggestedPrompts" class="prompt-row" aria-label="Gợi ý câu hỏi">
+            <button type="button">Tìm căn hộ 2PN dưới 3 tỷ ở TP.HCM</button>
+            <button type="button">Khu nào yên tĩnh phù hợp gia đình trẻ?</button>
+            <button type="button">Tìm nhà quanh VSIP, gần trường học và bệnh viện</button>
+            <button type="button">Lập báo cáo thị trường Quận 7</button>
+          </div>
+
+          <div id="chatMessages" class="chat-messages" aria-live="polite">
+            <article class="message assistant">
+              <div class="message-label">Assistant</div>
+              <p>
+                Chào bạn. Hãy mô tả nhu cầu mua, thuê, khu vực, ngân sách hoặc câu hỏi thị trường.
+                Tôi sẽ trả lời và ghim các bất động sản liên quan trên bản đồ.
+              </p>
+            </article>
+          </div>
+
+          <form id="chatForm" class="chat-form">
+            <textarea
+              id="chatInput"
+              rows="2"
+              placeholder="Ví dụ: Tôi muốn khu vực yên tĩnh, phù hợp gia đình trẻ ở TP.HCM..."
+            ></textarea>
+            <button id="sendButton" type="submit">Send</button>
+          </form>
+        </section>
+
+        <section class="evidence-panel" aria-label="Listing evidence">
+          <div class="evidence-head">
+            <div>
+              <h2>Listing Evidence</h2>
+              <p id="evidenceSummary">Loading listings...</p>
+            </div>
+            <button id="fitMapButton" type="button" title="Fit map to evidence">Fit map</button>
+          </div>
+
+          <section class="compact-filters" aria-label="Bộ lọc nhanh">
+            <label>
+              <span>Search</span>
+              <input id="searchInput" type="search" placeholder="Project, district, property type..." />
+            </label>
+            <label>
+              <span>Type</span>
+              <select id="listingType">
+                <option value="">All</option>
+                <option value="ban">For sale</option>
+                <option value="cho-thue">For rent</option>
+              </select>
+            </label>
+            <label>
+              <span>Province</span>
+              <select id="provinceSelect">
+                <option value="">All</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="stats" aria-label="Thống kê">
+            <div>
+              <span id="totalCount">0</span>
+              <small>listings</small>
+            </div>
+            <div>
+              <span id="saleCount">0</span>
+              <small>sale</small>
+            </div>
+            <div>
+              <span id="rentCount">0</span>
+              <small>rent</small>
+            </div>
+          </section>
+
+          <section id="listingList" class="listing-list" aria-label="Danh sách bất động sản"></section>
+        </section>
+      </aside>
+
+      <main class="map-area">
+        <div class="map-toolbar">
+          <div>
+            <strong id="mapTitle">Listings map</strong>
+            <span id="geoNote">Approximate pins until geocoding is available</span>
+          </div>
+          <a class="api-link" href="/api/listings" target="_blank" rel="noreferrer">API</a>
+        </div>
+        <div id="map"></div>
+      </main>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/app.js"></script>
+>>>>>>> main
   </body>
 </html>

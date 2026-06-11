@@ -1,80 +1,204 @@
+# Real Estate Assistant
 
-# Real Estate Assistant (batdongsan crawler)
+Crawler and ingestion toolkit for a real-estate RAG assistant. The project collects property listings, projects, market/wiki content, social review evidence, and nearby amenities.
 
-This repository contains a Playwright-based crawler for batdongsan.com.vn listings.
+## Setup
 
-**Quick TL;DR**: create a Python virtualenv, install dependencies, install Playwright browsers, then run `run.py` to crawl listings.
-
-**Requirements**
-- Python 3.10+ (3.11 recommended)
-- Linux / macOS / Windows
-- See `requirements.txt` for Python packages
-
-**Setup (Linux / macOS)**
-
-1. Create and activate a virtual environment:
+Use Python 3.10+.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-2. Install Python dependencies:
-
-```bash
 pip install -r requirements.txt
-```
-
-3. Install Playwright browsers (required for headless Chromium):
-
-```bash
 python -m playwright install chromium
 ```
 
-Note: On CI or headless servers you may need additional system packages for Chromium (e.g. `libnss3`, `libatk1.0-0`, `libxss1`, etc.).
-
-**Data directory**
-- The crawler writes output JSON files to the `data/` directory. Existing example files:
-	- `data/listings.json`
-	- `data/listings_cho_thue.json`
-
-**Running the crawler**
-
-Primary runner: [run.py](run.py)
-
-Basic usages:
+Optional API keys can be placed in `.env`:
 
 ```bash
-# Crawl 3 pages of sale listings (default)
-python run.py
+YOUTUBE_API_KEY=your_youtube_key
+GOOGLE_MAPS_API_KEY=optional_legacy_google_key
+```
 
-# Crawl rental listings
-python run.py --type cho-thue
+`YOUTUBE_API_KEY` enables YouTube comment/transcript crawling. Google Maps is optional legacy functionality; POI/amenity crawling uses OpenStreetMap by default and does not need a paid key.
 
-# Crawl 5 pages of sale listings
+## Data Crawl Order
+
+Recommended full workflow:
+
+```bash
+# 1. Crawl property listings and projects
+python run.py --type ban --pages 3
+python run.py --type cho-thue --pages 3
+python run.py --type du-an --pages 3
+
+# 2. Crawl general market/knowledge content
+python run.py --type tin-tuc --pages 3
+python run.py --type wiki --pages 3
+
+# 3. Add latitude/longitude to listings and projects
+python run.py --type geocode --geocode-limit 0
+
+# 4. Crawl nearby amenities within 2 km for every geocoded listing/project
+python run.py --type osm-poi
+
+# 5. Crawl related review/social evidence
+python run.py --type youtube --pages 3
+python run.py --type tiktok --pages 3
+python run.py --type voz --pages 3
+```
+
+You can also run the consolidated flow:
+
+```bash
+python run.py --type all --pages 3 --geocode-limit 0
+```
+
+In `--type all`, review keywords are generated lazily after fresh listings and projects have been crawled and saved. This means YouTube, TikTok, and VOZ searches use the newly crawled `dia_chi` and `ten_du_an` values, not stale keywords loaded at startup.
+
+For long OSM amenity crawls, prefer running `geocode` first, then `osm-poi` separately. The OSM crawler caches results in `data/.osm_cache.json` and checkpoints nearby amenities as it goes.
+
+## Listings And Projects
+
+```bash
 python run.py --type ban --pages 5
-
-# Crawl both sale and rental (3 pages each)
-python run.py --type all --pages 3
-
-# Skip visiting detail pages (faster, less data)
-python run.py --no-details
+python run.py --type cho-thue --pages 5
+python run.py --type all-listings --pages 5
+python run.py --type du-an --pages 3
 ```
 
-Alternatively, you can call the crawler directly from Python:
+Outputs:
 
-```py
-from crawler import crawl
-import asyncio
+- `data/listings_ban.json`
+- `data/listings_cho_thue.json`
+- `data/projects.json`
 
-asyncio.run(crawl(listing_type="ban", max_pages=3, visit_details=True))
+Use `--no-details` for faster crawls with less structured data. Use `--resume` to continue from crawler checkpoints.
+
+## Related Reviews
+
+When `--keywords` is omitted, review crawlers generate search keywords from crawled data:
+
+- listings: `review {dia_chi}`
+- projects: `review {ten_du_an}`
+
+Commands:
+
+```bash
+python run.py --type youtube
+python run.py --type tiktok
+python run.py --type voz --pages 3
 ```
 
-**Output**
-- By default the crawler saves results to `data/listings_<type>.json` (e.g. `data/listings_ban.json`).
-- Files are UTF-8 encoded JSON with pretty indentation.
+Default review limits:
 
-**Notes & tips**
-- Be polite: the crawler includes a `REQUEST_DELAY` and uses stealth headers to reduce bot detection.
-- If you see fewer results than expected, try increasing `--pages` or enabling `visit_details`.
-- If Playwright Chromium fails on your machine, run `python -m playwright install --with-deps` or install system deps for Chromium.
+- YouTube: 20 videos per keyword, up to 50 comments per video.
+- TikTok: 20 videos per keyword, up to 50 comments per video.
+- VOZ: 20 threads per keyword, across `--pages` search pages.
+
+Outputs:
+
+- `data/youtube_comments.json`
+- `data/tiktok_comments.json`
+- `data/voz_discussions.json`
+
+YouTube requires `YOUTUBE_API_KEY` in `.env`. TikTok and VOZ do not require API keys. Google reviews are not scraped; `google-reviews` is optional legacy functionality and requires `GOOGLE_MAPS_API_KEY`.
+
+You can override generated keywords:
+
+```bash
+python run.py --type youtube --keywords "review Vinhomes Ocean Park 3,review The Global City"
+python run.py --type voz --keywords "review Phu My Hung"
+```
+
+## Geocoding
+
+Geocoding uses Nominatim/OpenStreetMap and writes coordinates back into:
+
+- `data/listings_ban.json`
+- `data/listings_cho_thue.json`
+- `data/projects.json`
+
+Run all records:
+
+```bash
+python run.py --type geocode --geocode-limit 0
+```
+
+`--geocode-limit 0` means no limit, so all records are scanned. A positive value limits the number of records scanned per file:
+
+```bash
+python run.py --type geocode --geocode-limit 10
+```
+
+Added fields include:
+
+- `latitude`
+- `longitude`
+- `geo_source`
+- `geo_confidence`
+
+## Nearby Amenities
+
+Nearby amenities use OpenStreetMap Overpass and default to a 2 km radius.
+
+```bash
+python run.py --type osm-poi
+```
+
+This uses the geocoded `dia_chi` coordinates from sale listings, rental listings, and projects. Each source record gets:
+
+- `nearby_amenities`
+- `nearby_amenities_radius_m`
+- `nearby_amenities_source`
+- `nearby_amenities_target_latitude`
+- `nearby_amenities_target_longitude`
+
+Each amenity includes:
+
+- `name`
+- `category`
+- `address`
+- `latitude`
+- `longitude`
+- `distance_m`
+- `place_id`
+- `osm_type`
+- `osm_id`
+
+Global and per-record outputs:
+
+- `data/pois.json`: deduplicated global POI catalog
+- `data/nearby_amenities.json`: source-record to nearby-amenities mapping
+- source files also get embedded `nearby_amenities`
+
+Supported amenity categories:
+
+- `school`
+- `hospital`
+- `transit_station`
+- `park`
+- `shopping_mall`
+- `supermarket`
+
+Manual coordinate search:
+
+```bash
+python run.py --type osm-poi --coords 10.7769,106.7009 --radius 2000
+```
+
+## Ingestion
+
+After JSON data exists, ingest into the database/vector pipeline:
+
+```bash
+python -m db.ingest --source all
+```
+
+POIs are ingested as structured Postgres facts from `data/pois.json`; they are not embedded into Qdrant by default.
+
+## Notes
+
+- `data/.osm_cache.json` stores OSM geocode and POI cache entries.
+- Public OSM endpoints can rate-limit. Rerun `python run.py --type osm-poi`; cached records will be reused.
+- `.env`, `data/`, cache files, and local generated artifacts should stay out of git.

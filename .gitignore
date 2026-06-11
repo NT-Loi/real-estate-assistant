@@ -1,0 +1,15 @@
+.venv
+data
+__pycache__
+.vscode
+.env
+db
+docs
+rag
+scratch
+scripts
+db_data
+.agents
+.codex
+*.ipynb
+*.pptx
