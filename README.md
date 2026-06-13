@@ -2,6 +2,8 @@
 
 An intelligent, Vietnamese-language real estate assistant featuring a **data crawling engine**, a **PostgreSQL + Qdrant RAG ingestion pipeline**, and a **ReAct (Reasoning & Action) Agent** served via **FastAPI** to an interactive **React + Leaflet Map** dashboard.
 
+![Chatbot Interface](imgs/chatbot.png)
+
 ---
 
 ## 🗺️ System Architecture
@@ -37,6 +39,9 @@ graph TD
     Q -->|SSE Payload| R
     R -->|Render UI Markers & Map| S[React Frontend Leaflet Map Client]
 ```
+
+### 📊 System Architecture Diagram
+![RAG Architecture](imgs/rag.png)
 
 ---
 
