@@ -1,22 +1,37 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import mimetypes
+import os
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+import uuid
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-
+from typing import Any, Optional, Dict, List
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import uvicorn
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
 RAG_CHAIN = None
 RAG_INIT_ERROR = None
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("bds_server")
 
 CITY_COORDS = {
     "Hà Nội": (21.0285, 105.8542),
@@ -36,7 +51,6 @@ CITY_COORDS = {
     "Nam Định": (20.4388, 106.1621),
 }
 
-
 DISTRICT_COORDS = {
     "Quận 1": (10.7756, 106.7019),
     "Quận 2": (10.7873, 106.7498),
@@ -51,7 +65,6 @@ DISTRICT_COORDS = {
     "Thành phố Nha Trang": (12.2388, 109.1967),
     "Thành phố Hạ Long": (20.9599, 107.0425),
 }
-
 
 def parse_number(raw: object) -> float | None:
     if raw is None:
@@ -74,7 +87,6 @@ def parse_number(raw: object) -> float | None:
     except ValueError:
         return None
 
-
 def price_vnd(raw: object) -> int | None:
     if not raw:
         return None
@@ -92,10 +104,8 @@ def price_vnd(raw: object) -> int | None:
         return int(num * 1_000_000)
     return int(num * 1_000_000) if num > 100 else None
 
-
 def first_line(raw: object) -> str:
     return str(raw or "").splitlines()[0].replace(". Xem bản đồ", "").strip()
-
 
 def location_parts(address: str, fallback_area: str = "") -> dict[str, str]:
     parts = [p.strip() for p in first_line(address or fallback_area).split(",") if p.strip()]
@@ -111,13 +121,11 @@ def location_parts(address: str, fallback_area: str = "") -> dict[str, str]:
     province = province.replace("Hồ Chí Minh mới", "Hồ Chí Minh").replace("Ninh Bình mới", "Ninh Bình")
     return {"province": province, "district": district, "ward": ward}
 
-
 def stable_offset(seed: str, scale: float = 0.035) -> tuple[float, float]:
     value = sum((idx + 1) * ord(ch) for idx, ch in enumerate(seed))
     angle = (value % 360) * math.pi / 180
     radius = ((value % 100) / 100) * scale
     return math.sin(angle) * radius, math.cos(angle) * radius
-
 
 def approximate_coords(record: dict) -> tuple[float, float, str]:
     lat = record.get("latitude") or record.get("lat")
@@ -131,7 +139,6 @@ def approximate_coords(record: dict) -> tuple[float, float, str]:
         base = CITY_COORDS.get(record.get("khu_vuc", ""), (16.0, 106.0))
     dlat, dlng = stable_offset(record.get("url") or record.get("tieu_de") or "")
     return base[0] + dlat, base[1] + dlng, "approximate"
-
 
 def load_listings() -> list[dict]:
     rows: list[dict] = []
@@ -173,9 +180,7 @@ def load_listings() -> list[dict]:
             )
     return rows
 
-
 LISTINGS = load_listings()
-
 
 def listing_stats(rows: list[dict]) -> dict:
     priced = [r["price_vnd"] for r in rows if r.get("price_vnd")]
@@ -189,23 +194,86 @@ def listing_stats(rows: list[dict]) -> dict:
         "approximate_geo_count": sum(1 for r in rows if r["geo_precision"] == "approximate"),
     }
 
-
 def get_rag_chain():
-    """Initialize RAG lazily so static map/listing UI survives DB outages."""
-    global RAG_CHAIN, RAG_INIT_ERROR
+    """Return the already-initialized RAG chain, or raise if startup failed."""
     if RAG_CHAIN is not None:
         return RAG_CHAIN
     if RAG_INIT_ERROR is not None:
         raise RAG_INIT_ERROR
-    try:
-        from rag.chain import RAGChain
+    # Should not reach here after lifespan runs, but guard anyway
+    raise RuntimeError("RAG chain not yet initialized")
 
-        RAG_CHAIN = RAGChain()
-        return RAG_CHAIN
+
+# ---------------------------------------------------------------------------
+# Startup health status tracker
+# ---------------------------------------------------------------------------
+STARTUP_STATUS: dict[str, Any] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Eagerly initialize all heavy resources at server startup:
+      1. RAGChain (triggers VectorStore → Qdrant + PostgreSQL connections)
+      2. Embedding model (SentenceTransformer warm-up)
+      3. LLM client (Ollama/Gemini availability check)
+    """
+    global RAG_CHAIN, RAG_INIT_ERROR
+    t0 = time.monotonic()
+    log.info("="*60)
+    log.info("  Starting RAG Real-Estate Assistant — loading all components…")
+    log.info("="*60)
+
+    # ── 1. RAGChain (includes VectorStore + embedding model + PostgreSQL) ──
+    try:
+        log.info("[1/3] Initializing RAGChain (Qdrant + PostgreSQL + embedding model)…")
+        loop = asyncio.get_event_loop()
+        from rag.chain import RAGChain
+        RAG_CHAIN = await loop.run_in_executor(None, RAGChain)
+        STARTUP_STATUS["rag_chain"] = "ok"
+        log.info("[1/3] ✓ RAGChain ready")
     except Exception as exc:
         RAG_INIT_ERROR = exc
-        raise
+        STARTUP_STATUS["rag_chain"] = f"error: {exc}"
+        log.error(f"[1/3] ✗ RAGChain failed: {exc}")
+        log.warning("      Chat will fall back to local listing search.")
 
+    # ── 2. LLM warm-up ping ─────────────────────────────────────────────────
+    try:
+        log.info("[2/3] Warming up LLM client…")
+        if RAG_CHAIN is not None:
+            llm = RAG_CHAIN._llm
+            provider = getattr(llm, "_provider", "unknown")
+            model = getattr(llm, "_ollama_model", None) or getattr(llm, "_model_name", "unknown")
+            available = getattr(llm, "is_available", False)
+            if available:
+                # Send a trivial generation to warm up the model cache
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: llm.generate("hi", max_tokens=1, temperature=0.0))
+                STARTUP_STATUS["llm"] = f"ok ({provider}: {model})"
+                log.info(f"[2/3] ✓ LLM ready ({provider}: {model})")
+            else:
+                STARTUP_STATUS["llm"] = "unavailable (no API key or connection)"
+                log.warning(f"[2/3] ⚠ LLM unavailable — using formatted fallback")
+        else:
+            STARTUP_STATUS["llm"] = "skipped (RAGChain not loaded)"
+            log.info("[2/3] - LLM check skipped (RAGChain not loaded)")
+    except Exception as exc:
+        STARTUP_STATUS["llm"] = f"error: {exc}"
+        log.error(f"[2/3] ✗ LLM warm-up error: {exc}")
+
+    # ── 3. Summary ──────────────────────────────────────────────────────────
+    elapsed = time.monotonic() - t0
+    STARTUP_STATUS["startup_seconds"] = round(elapsed, 2)
+    log.info("="*60)
+    log.info(f"  All components loaded in {elapsed:.1f}s — server ready!")
+    log.info(f"  RAG:  {STARTUP_STATUS.get('rag_chain', '?')}")
+    log.info(f"  LLM:  {STARTUP_STATUS.get('llm', '?')}")
+    log.info("="*60)
+
+    yield  # ← server runs here
+
+    log.info("Shutting down RAG Real-Estate Assistant…")
 
 def local_listing_search(message: str, limit: int = 12) -> list[dict]:
     """Small local fallback when RAG infrastructure is unavailable."""
@@ -283,7 +351,6 @@ def local_listing_search(message: str, limit: int = 12) -> list[dict]:
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _, item in scored[:limit]] or LISTINGS[:limit]
 
-
 def serialize_source(doc) -> dict:
     meta = getattr(doc, "metadata", {}) or {}
     record = getattr(doc, "record", None) or {}
@@ -296,7 +363,6 @@ def serialize_source(doc) -> dict:
         "url": url,
     }
 
-
 def listings_from_sources(sources: list[dict], fallback_query: str) -> list[dict]:
     source_urls = {source.get("url") for source in sources if source.get("url")}
     if source_urls:
@@ -305,117 +371,204 @@ def listings_from_sources(sources: list[dict], fallback_query: str) -> list[dict
             return matched
     return local_listing_search(fallback_query)
 
+# Setup FastAPI App
+app = FastAPI(title="Real Estate Assistant RAG API", lifespan=lifespan)
 
-class Handler(BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        parsed = urlparse(self.path)
-        path = WEB_DIR / ("index.html" if parsed.path == "/" else parsed.path.lstrip("/"))
-        if not path.resolve().is_relative_to(WEB_DIR.resolve()) or not path.exists():
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(path.stat().st_size))
-        self.end_headers()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/listings":
-            self.send_json(self.filter_listings(parse_qs(parsed.query)))
-            return
-        if parsed.path == "/api/stats":
-            self.send_json(listing_stats(LISTINGS))
-            return
-        path = WEB_DIR / ("index.html" if parsed.path == "/" else parsed.path.lstrip("/"))
-        if not path.resolve().is_relative_to(WEB_DIR.resolve()) or not path.exists():
-            self.send_error(404)
-            return
-        body = path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+class ChatRequest(BaseModel):
+    message: str
 
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path != "/api/chat":
-            self.send_error(404)
-            return
+@app.get("/api/status")
+def get_status():
+    """Health check — shows startup status of all RAG components."""
+    return {
+        "status": "ok" if RAG_CHAIN is not None else "degraded",
+        "rag_chain": STARTUP_STATUS.get("rag_chain", "not started"),
+        "llm": STARTUP_STATUS.get("llm", "not started"),
+        "startup_seconds": STARTUP_STATUS.get("startup_seconds"),
+        "listings_loaded": len(LISTINGS),
+    }
 
+# Legacy static routes removed, served via StaticFiles mount below.
+
+@app.get("/api/listings")
+def get_listings(
+    q: str = None,
+    listing_type: str = None,
+    province: str = None,
+    min_price: int = None,
+    max_price: int = None,
+    min_area: float = None,
+    max_area: float = None,
+    bedrooms: int = None,
+    bathrooms: int = None,
+    sort_by: str = None,
+    limit: int = 500
+):
+    rows = LISTINGS
+    if listing_type:
+        rows = [r for r in rows if r.get("listing_type") == listing_type]
+    if province:
+        rows = [r for r in rows if province.lower() in r.get("province", "").lower()]
+    if q:
+        q_lower = q.lower()
+        rows = [
+            r for r in rows
+            if q_lower in " ".join([r.get("title", ""), r.get("address", ""), r.get("project", ""), r.get("property_type", "")]).lower()
+        ]
+    if min_price is not None:
+        rows = [r for r in rows if r.get("price_vnd") and r["price_vnd"] >= min_price]
+    if max_price is not None:
+        rows = [r for r in rows if r.get("price_vnd") and r["price_vnd"] <= max_price]
+    if min_area is not None:
+        rows = [r for r in rows if r.get("area_m2") and r["area_m2"] >= min_area]
+    if max_area is not None:
+        rows = [r for r in rows if r.get("area_m2") and r["area_m2"] <= max_area]
+    if bedrooms is not None:
+        rows = [r for r in rows if r.get("bedrooms") == bedrooms]
+    if bathrooms is not None:
+        rows = [r for r in rows if r.get("bathrooms") == bathrooms]
+        
+    if sort_by == "price_asc":
+        rows = sorted(rows, key=lambda x: x.get("price_vnd") or float('inf'))
+    elif sort_by == "price_desc":
+        rows = sorted(rows, key=lambda x: x.get("price_vnd") or -float('inf'), reverse=True)
+    elif sort_by == "area_asc":
+        rows = sorted(rows, key=lambda x: x.get("area_m2") or float('inf'))
+    elif sort_by == "area_desc":
+        rows = sorted(rows, key=lambda x: x.get("area_m2") or -float('inf'), reverse=True)
+        
+    return {"items": rows[:limit], "stats": listing_stats(rows)}
+
+@app.get("/api/stats")
+def get_stats():
+    return listing_stats(LISTINGS)
+
+@app.get("/api/listings/{listing_id}/pois")
+def get_listing_pois(listing_id: str):
+    # Find the listing in LISTINGS to get its url
+    listing = None
+    for item in LISTINGS:
+        if item.get("id") == listing_id:
+            listing = item
+            break
+            
+    if not listing:
+        return {"pois": [], "error": f"Listing {listing_id} not found locally"}
+        
+    url = listing.get("url")
+    if not url:
+        return {"pois": [], "error": "No URL found for this listing"}
+        
+    # Generate the DB ID using uuid.uuid5
+    try:
+        raw_key = f"listing:{url}:0"
+        db_id = str(uuid.uuid5(uuid.NAMESPACE_URL, raw_key))
+    except Exception as e:
+        return {"pois": [], "error": f"Failed to generate DB ID: {e}"}
+        
+    # Query PostgreSQL for nearby POIs
+    try:
+        from db.postgres_client import PostgresClient
+        pg = PostgresClient()
+        categories = ["transit_station", "school", "hospital", "park"]
+        poi_map = pg.fetch_nearby_pois(
+            [db_id], entity_type="listing",
+            categories=categories, top_n_per_category=5
+        )
+        pois = poi_map.get(db_id, [])
+        return {"pois": pois}
+    except Exception as e:
+        log.warning(f"Failed to fetch POIs for listing {listing_id} from PostgreSQL: {e}")
+        return {"pois": [], "error": str(e)}
+
+@app.post("/api/chat")
+def chat(payload: ChatRequest):
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    def sse_stream():
+        """Generator that yields SSE-formatted events."""
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(length).decode("utf-8") if length else "{}"
-            payload = json.loads(raw_body)
-            message = str(payload.get("message") or "").strip()
-        except Exception:
-            self.send_json({"error": "Invalid JSON body", "answer": "", "sources": [], "listings": []}, status=400)
-            return
+            chain = get_rag_chain()
+            mapped_listings = None
 
-        if not message:
-            self.send_json({"error": "Message is required", "answer": "", "sources": [], "listings": []}, status=400)
-            return
+            for event in chain.query_stream(message):
+                etype = event.get("type")
 
-        try:
-            result = get_rag_chain().query(message)
-            sources = [serialize_source(doc) for doc in result.sources]
-            listings = listings_from_sources(sources, message)
-            self.send_json(
-                {
-                    "answer": result.answer,
-                    "intent": result.intent,
-                    "filters_applied": result.filters_applied,
-                    "sources": sources,
-                    "listings": listings,
-                    "llm_used": result.llm_used,
-                }
-            )
+                if etype == "metadata":
+                    sources = event.get("sources", [])
+                    # Compute matching map listings immediately
+                    mapped_listings = listings_from_sources(sources, message)
+                    meta_payload = {
+                        "intent": event.get("intent", ""),
+                        "filters_applied": event.get("filters", {}),
+                        "sources": sources,
+                        "listings": mapped_listings,
+                        "llm_used": True,
+                    }
+                    yield f"event: metadata\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
+
+                elif etype == "chunk":
+                    text = event.get("text", "")
+                    if text:
+                        # Escape newlines so SSE data field stays on one line
+                        yield f"event: chunk\ndata: {json.dumps(text, ensure_ascii=False)}\n\n"
+
+                elif etype == "done":
+                    yield "event: done\ndata: {}\n\n"
+                    return
+
         except Exception as exc:
+            log.warning(f"RAG streaming failed, sending fallback: {exc}")
             listings = local_listing_search(message)
-            self.send_json(
-                {
-                    "answer": (
-                        "Tôi chưa kết nối được RAG backend trong phiên này, "
-                        "nên tạm thời hiển thị các tin đăng khớp từ dữ liệu local."
-                    ),
-                    "intent": "local_fallback",
-                    "filters_applied": {},
-                    "sources": [],
-                    "listings": listings,
-                    "error": str(exc),
-                }
+            meta_payload = {
+                "intent": "local_fallback",
+                "filters_applied": {},
+                "sources": [],
+                "listings": listings,
+                "llm_used": False,
+                "error": str(exc),
+            }
+            yield f"event: metadata\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
+            fallback_text = (
+                "Tôi chưa kết nối được RAG backend trong phiên này, "
+                "nên tạm thời hiển thị các tin đăng khớp từ dữ liệu local."
             )
+            yield f"event: chunk\ndata: {json.dumps(fallback_text, ensure_ascii=False)}\n\n"
+            yield "event: done\ndata: {}\n\n"
 
-    def filter_listings(self, query: dict[str, list[str]]) -> dict:
-        rows = LISTINGS
-        listing_type = query.get("listing_type", [""])[0]
-        province = query.get("province", [""])[0].lower()
-        q = query.get("q", [""])[0].lower()
-        if listing_type:
-            rows = [r for r in rows if r["listing_type"] == listing_type]
-        if province:
-            rows = [r for r in rows if province in r["province"].lower()]
-        if q:
-            rows = [
-                r for r in rows
-                if q in " ".join([r["title"], r["address"], r["project"], r["property_type"]]).lower()
-            ]
-        return {"items": rows[:500], "stats": listing_stats(rows)}
+    return StreamingResponse(
+        sse_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
-    def send_json(self, payload: object, status: int = 200):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
+SERVE_FRONTEND = os.environ.get("SERVE_FRONTEND", "true").lower() not in ("false", "0", "no")
+if SERVE_FRONTEND:
+    _dist = ROOT / "frontend" / "dist"
+    if _dist.exists():
+        app.mount("/", StaticFiles(directory=_dist, html=True), name="static")
+        log.info(f"Serving frontend from {_dist}")
+    else:
+        log.warning(f"Frontend dist not found at {_dist}. Run 'npm run build' in frontend/ first, or set SERVE_FRONTEND=false.")
+else:
+    log.info("SERVE_FRONTEND=false — skipping static files mount (API-only mode)")
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), Handler)
-    print("Web frontend: http://127.0.0.1:8000")
-    server.serve_forever()
-
+    print("Starting FastAPI web server on http://127.0.0.1:8000")
+    uvicorn.run("web.server:app", host="127.0.0.1", port=8000, reload=False)
 
 if __name__ == "__main__":
     main()

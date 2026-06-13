@@ -3,9 +3,9 @@ data
 __pycache__
 .vscode
 .env
-db
+# db
 docs
-rag
+# rag
 scratch
 scripts
 db_data
@@ -13,3 +13,5 @@ db_data
 .codex
 *.ipynb
 *.pptx
+*.txt
+tests

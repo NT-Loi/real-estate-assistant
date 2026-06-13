@@ -1,7 +1,14 @@
+import sys
+from pathlib import Path
+
+# Add project root to sys.path to ensure absolute imports work
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import argparse
 import asyncio
 import logging
-from pathlib import Path
 
 # Set up global logging format matching our package crawlers
 logging.basicConfig(
@@ -358,7 +365,7 @@ async def run_crawlers_async(args):
                 from crawlers.config import DATA_DIR
                 coordinate_targets = load_geocoded_dia_chi_coords(DATA_DIR)
                 if not coordinate_targets:
-                    log.error("No geocoded dia_chi coordinates found. Run: python run.py --type geocode --geocode-limit 0")
+                    log.error("No geocoded dia_chi coordinates found. Run: python crawlers/run.py --type geocode --geocode-limit 0")
                     return
 
             log.info(f"Running POI search for {len(coordinate_targets)} coordinate target(s), Radius: {args.radius}m")
