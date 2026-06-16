@@ -229,6 +229,8 @@ class NewsCrawler(BaseCrawler):
             self.log.info("Crawl target already reached/exceeded by checkpoints.")
             return all_articles
 
+        consecutive_empty_pages = 0
+
         async with async_playwright() as pw:
             browser = await launch_browser(pw)
             
@@ -252,6 +254,19 @@ class NewsCrawler(BaseCrawler):
                 cards = await self._extract_article_cards(page)
                 self.log.info(f"Extracted {len(cards)} articles from page {pg}")
 
+                if not cards:
+                    consecutive_empty_pages += 1
+                    await context.close()
+                    self.checkpoint_mgr.save(pg, [])
+                    if consecutive_empty_pages >= 3:
+                        self.log.info(
+                            f"Stopping news crawl after {consecutive_empty_pages} consecutive empty pages."
+                        )
+                        break
+                    await self.sleep_polite(REQUEST_DELAY * 2)
+                    continue
+
+                consecutive_empty_pages = 0
                 page_articles = []
                 for idx, card in enumerate(cards):
                     card_url = card.get("url")

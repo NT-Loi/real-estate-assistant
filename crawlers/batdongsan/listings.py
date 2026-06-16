@@ -52,7 +52,7 @@ class ListingCrawler(BaseCrawler):
         """Wait until listing cards are visible on the page."""
         for selector in [".js__card", "[data-tracking-id]", ".re__card-full"]:
             try:
-                await page.wait_for_selector(selector, timeout=10_000)
+                await page.wait_for_selector(selector, timeout=20_000)
                 return True
             except Exception:
                 continue
@@ -434,31 +434,43 @@ class ListingCrawler(BaseCrawler):
             browser = await launch_browser(pw)
             
             for pg in range(start_page, max_pages + 1):
-                # Fresh browser context per page to thwart session/cookie tracking
-                context, page = await new_stealth_page(browser)
-                
                 url = self.listing_url if pg == 1 else f"{self.listing_url}/p{pg}"
-                self.log.info(f"Navigating to page {pg}: {url}")
-                
-                if not await goto_safe(page, url):
-                    self.log.warning(f"Failed to navigate to {url}. Skipping page {pg}")
-                    await context.close()
-                    continue
+                context = None
+                page = None
+                cards = []
 
-                await asyncio.sleep(5)
-                found = await self.sleep_polite() or await self._wait_for_listings(page)
-                if not found:
-                    self.log.warning(f"No cards found on page {pg}. Scrolling...")
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                    await asyncio.sleep(2)
+                # Fresh browser context per attempt to thwart session/cookie tracking and transient challenge pages.
+                for page_attempt in range(1, 4):
+                    context, page = await new_stealth_page(browser)
+                    self.log.info(f"Navigating to page {pg} (attempt {page_attempt}/3): {url}")
+
+                    if not await goto_safe(page, url):
+                        self.log.warning(f"Failed to navigate to {url} on attempt {page_attempt}")
+                        await context.close()
+                        context = None
+                        continue
+
+                    await asyncio.sleep(2 if page_attempt == 1 else 5)
                     found = await self._wait_for_listings(page)
-                
-                if not found:
-                    self.log.error(f"Still no listings on page {pg}. Stop crawler.")
+                    if not found:
+                        self.log.warning(f"No cards found on page {pg}. Scrolling...")
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                        await asyncio.sleep(4)
+                        found = await self._wait_for_listings(page)
+
+                    if found:
+                        cards = await self._extract_cards(page)
+                        if cards:
+                            break
+
+                    self.log.warning(f"No extractable listings on page {pg} attempt {page_attempt}. Retrying...")
                     await context.close()
+                    context = None
+
+                if not cards:
+                    self.log.error(f"Still no listings on page {pg} after retries. Stop crawler.")
                     break
 
-                cards = await self._extract_cards(page)
                 self.log.info(f"Extracted {len(cards)} listings on page {pg}")
 
                 page_listings = []
@@ -498,7 +510,8 @@ class ListingCrawler(BaseCrawler):
                     if (idx + 1) % 5 == 0:
                         self.log.info(f"  Progress page {pg}: {idx+1}/{len(cards)}")
 
-                await context.close()
+                if context:
+                    await context.close()
                 self.checkpoint_mgr.save(pg, page_listings)
                 await self.sleep_polite(REQUEST_DELAY * 2)
 

@@ -232,6 +232,12 @@ def parse_args():
         help="Comma-separated query keywords for search-based crawlers. Defaults to generated 'review {dia_chi}' and 'review {ten_du_an}' keywords from crawled data.",
     )
     parser.add_argument(
+        "--keywords-file",
+        type=str,
+        default="",
+        help="Path to a newline-delimited keyword file for search-based crawlers. Values are appended to --keywords.",
+    )
+    parser.add_argument(
         "--urls",
         type=str,
         default="",
@@ -267,13 +273,36 @@ async def run_crawlers_async(args):
     
     def resolve_keywords():
         kw_list = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        if getattr(args, "keywords_file", ""):
+            keywords_path = Path(args.keywords_file)
+            if not keywords_path.is_absolute():
+                keywords_path = Path.cwd() / keywords_path
+            try:
+                file_keywords = [
+                    line.strip()
+                    for line in keywords_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+                log.info(f"Loaded {len(file_keywords)} keyword(s) from {keywords_path}")
+                kw_list.extend(file_keywords)
+            except FileNotFoundError:
+                log.warning(f"Keyword file not found: {keywords_path}")
+            except Exception as e:
+                log.warning(f"Error reading keyword file {keywords_path}: {e}")
         if not kw_list or getattr(args, "auto_keywords", False):
             from crawlers.config import DATA_DIR
             gen_kws = generate_keywords_from_listings(DATA_DIR)
             if gen_kws:
                 log.info(f"Automatically resolved location review keywords: {gen_kws}")
                 kw_list = gen_kws + kw_list if kw_list else gen_kws
-        return kw_list
+        seen = set()
+        unique_keywords = []
+        for kw in kw_list:
+            key = kw.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique_keywords.append(kw)
+        return unique_keywords
 
     url_list = [u.strip() for u in args.urls.split(",") if u.strip()]
 

@@ -319,6 +319,8 @@ class VozCrawler(BaseCrawler):
                 if start_page > max_pages:
                     self.log.info("Crawl goal already achieved.")
                 else:
+                    consecutive_empty_pages = 0
+
                     for pg in range(start_page, max_pages + 1):
                         url = self.forum_url if pg == 1 else f"{self.forum_url}/page-{pg}"
                         self.log.info(f"Fetching forum list page {pg}: {url}")
@@ -334,6 +336,18 @@ class VozCrawler(BaseCrawler):
                         threads = self.parse_threads_page(html)
                         self.log.info(f"Found {len(threads)} threads on page {pg}")
 
+                        if not threads:
+                            consecutive_empty_pages += 1
+                            self.checkpoint_mgr.save(pg, [])
+                            if consecutive_empty_pages >= 3:
+                                self.log.info(
+                                    f"Stopping VOZ crawl after {consecutive_empty_pages} consecutive empty pages."
+                                )
+                                break
+                            await self.sleep_polite(REQUEST_DELAY * 2)
+                            continue
+
+                        consecutive_empty_pages = 0
                         page_discussions = []
                         threads_processed_count = 0
 

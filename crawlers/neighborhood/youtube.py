@@ -11,6 +11,7 @@ from crawlers.base import BaseCrawler
 from crawlers.config import DATA_DIR, YOUTUBE_API_KEY
 
 log = logging.getLogger("bds_crawler.youtube")
+YOUTUBE_MIN_PUBLISHED_AFTER = os.getenv("YOUTUBE_MIN_PUBLISHED_AFTER", "2025-01-01T00:00:00Z")
 
 # EMOJI normalizer mappings from the user's notebook
 CUSTOM_EMOJI_MAP = {
@@ -61,6 +62,9 @@ class YouTubeCrawler(BaseCrawler):
                 reason = data["error"].get("errors", [{}])[0].get("reason", "")
                 if reason in ("quotaExceeded", "dailyLimitExceeded"):
                     raise RuntimeError("YouTube API Quota exceeded. Please resume later.")
+                if reason in ("commentsDisabled", "videoNotFound", "forbidden"):
+                    self.log.warning(f"YouTube API Error ({reason}): {data['error'].get('message')}. Skipping.")
+                    return {}
                 
                 self.log.warning(f"YouTube API Error ({reason}): {data['error'].get('message')}. Retrying...")
             except requests.RequestException as e:
@@ -71,13 +75,20 @@ class YouTubeCrawler(BaseCrawler):
 
     def fetch_videos_by_keyword(self, keyword: str, max_results: int = 5) -> List[Dict[str, Any]]:
         """Search YouTube for videos by keyword. Uses the keyword as-is for maximum flexibility."""
-        self.log.info(f"Searching videos for: '{keyword}'")
+        self.log.info(
+            "Searching YouTube videos for: '%s' (max_results=%s, published_after=%s)",
+            keyword,
+            max_results,
+            YOUTUBE_MIN_PUBLISHED_AFTER,
+        )
         params = {
             "part": "snippet",
             "q": keyword,
             "type": "video",
             "maxResults": max_results,
             "relevanceLanguage": "vi",
+            "publishedAfter": YOUTUBE_MIN_PUBLISHED_AFTER,
+            "order": "date",
         }
         data = self._call_api("search", params)
         videos = []
@@ -93,6 +104,17 @@ class YouTubeCrawler(BaseCrawler):
                     "publish_date": snippet.get("publishedAt"),
                     "url": f"https://www.youtube.com/watch?v={vid_id}"
                 })
+        self.log.info("YouTube search returned %s video(s) for keyword: '%s'", len(videos), keyword)
+        for idx, video in enumerate(videos[:5], start=1):
+            self.log.info(
+                "  YouTube result %s/%s: id=%s published=%s channel=%s title=%r",
+                idx,
+                len(videos),
+                video.get("video_id"),
+                video.get("publish_date"),
+                video.get("channel"),
+                video.get("title"),
+            )
         return videos
 
     def fetch_video_details(self, video_id: str) -> Dict[str, Any]:
@@ -259,7 +281,16 @@ class YouTubeCrawler(BaseCrawler):
             next_token_top = data.get("nextPageToken")
             if not next_token_top:
                 break
-                
+
+        top_count = sum(1 for c in comments_list if not c.get("is_reply"))
+        reply_count = sum(1 for c in comments_list if c.get("is_reply"))
+        self.log.info(
+            "Fetched YouTube comments for video %s: total=%s top_level=%s replies=%s",
+            video_id,
+            len(comments_list),
+            top_count,
+            reply_count,
+        )
         return comments_list
 
     async def crawl(
@@ -274,25 +305,53 @@ class YouTubeCrawler(BaseCrawler):
             self.log.error("YOUTUBE_API_KEY environment variable is not set. Cannot run YouTubeCrawler.")
             return []
 
-        self.log.info(f"Starting YouTube Neighborhood Crawl. Keywords: {keywords}")
+        self.log.info(
+            "Starting YouTube Neighborhood Crawl. keywords=%s max_videos_per_kw=%s max_comments_per_video=%s published_after=%s resume=%s",
+            len(keywords or []),
+            max_videos_per_kw,
+            max_comments_per_video,
+            YOUTUBE_MIN_PUBLISHED_AFTER,
+            resume,
+        )
         all_results = []
+        stats = {
+            "keywords": len(keywords or []),
+            "search_results": 0,
+            "skipped_existing": 0,
+            "processed": 0,
+            "comments": 0,
+            "transcripts": 0,
+        }
         
         if resume:
             self.checkpoint_mgr.load()
-            all_results = self.checkpoint_mgr.get_processed_items()
-            self.log.info(f"Resumed crawl. Loaded {len(all_results)} existing videos from checkpoints.")
+            all_results = self.load_existing_data() + self.checkpoint_mgr.get_processed_items()
+            self.log.info(f"Resumed crawl. Loaded {len(all_results)} existing videos from output/checkpoints.")
 
         processed_vids = {item["video_id"] for item in all_results if "video_id" in item}
 
         for kw in keywords:
             videos = self.fetch_videos_by_keyword(kw, max_results=max_videos_per_kw)
+            stats["search_results"] += len(videos)
+            keyword_processed = 0
+            keyword_skipped_existing = 0
             
             for idx, vid in enumerate(videos):
                 vid_id = vid["video_id"]
                 if vid_id in processed_vids:
+                    keyword_skipped_existing += 1
+                    stats["skipped_existing"] += 1
                     continue
 
-                self.log.info(f"Processing video {idx+1}/{len(videos)}: {vid_id} ('{vid['title']}')")
+                self.log.info(
+                    "Processing YouTube video %s/%s for keyword=%r: id=%s published=%s title=%r",
+                    idx + 1,
+                    len(videos),
+                    kw,
+                    vid_id,
+                    vid.get("publish_date"),
+                    vid.get("title"),
+                )
                 
                 # Fetch full video details (complete description + stats)
                 details = self.fetch_video_details(vid_id)
@@ -300,6 +359,8 @@ class YouTubeCrawler(BaseCrawler):
                 # Fetch comments and transcript
                 comments_data = self.fetch_comments_for_video(vid_id, max_comments=max_comments_per_video)
                 transcript = self.fetch_video_transcript(vid_id)
+                if transcript:
+                    self.log.info("Fetched YouTube transcript for video %s: chars=%s", vid_id, len(transcript))
 
                 # Assemble
                 vid_record = {
@@ -323,6 +384,11 @@ class YouTubeCrawler(BaseCrawler):
                 
                 all_results.append(vid_record)
                 processed_vids.add(vid_id)
+                keyword_processed += 1
+                stats["processed"] += 1
+                stats["comments"] += len(comments_data)
+                if transcript:
+                    stats["transcripts"] += 1
                 
                 # Save progress checkpoint
                 self.checkpoint_mgr.save(idx, [vid_record])
@@ -330,5 +396,23 @@ class YouTubeCrawler(BaseCrawler):
                 # Sleep a short delay to stay polite
                 await self.sleep_polite(1.0)
 
+            self.log.info(
+                "YouTube keyword summary: keyword=%r search_results=%s processed_new=%s skipped_existing=%s",
+                kw,
+                len(videos),
+                keyword_processed,
+                keyword_skipped_existing,
+            )
+
         self.save_final_results(all_results, resume)
+        self.log.info(
+            "YouTube crawl summary: keywords=%s search_results=%s processed_new=%s skipped_existing=%s comments=%s transcripts=%s total_records_after_merge=%s",
+            stats["keywords"],
+            stats["search_results"],
+            stats["processed"],
+            stats["skipped_existing"],
+            stats["comments"],
+            stats["transcripts"],
+            len(all_results),
+        )
         return all_results

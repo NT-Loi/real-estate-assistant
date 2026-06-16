@@ -18,6 +18,7 @@ from crawlers.browser import launch_browser, new_stealth_page
 from crawlers.config import DATA_DIR, TIKTOK_COOKIES_FILE
 
 log = logging.getLogger("bds_crawler.tiktok")
+TIKTOK_MIN_CREATED_AT = os.getenv("TIKTOK_MIN_CREATED_AT", "2025-01-01T00:00:00Z")
 
 TIKTOK_KEYWORD_STOPWORDS = {
     "review", "danh", "gia", "cho", "thue", "ban", "nha", "dat", "can", "ho", "chung", "cu",
@@ -212,6 +213,7 @@ class TikTokCrawler(BaseCrawler):
         """Extract top comments and fetch associated replies in a structured format."""
         comments = self.fetch_comments(aweme_id, max_comments=max_comments)
         results = []
+        total_replies = 0
         
         for idx, c in enumerate(comments):
             cid = c.get("cid")
@@ -238,10 +240,18 @@ class TikTokCrawler(BaseCrawler):
                             "like_count": r.get("digg_count", 0),
                             "published_at": datetime.datetime.fromtimestamp(r.get("create_time", 0)).isoformat() + "Z" if r.get("create_time") else None,
                         })
+                    total_replies += len(item["replies"])
                 except Exception as e:
                     self.log.warning(f"Failed to fetch replies for comment {cid}: {e}")
             
             results.append(item)
+        self.log.info(
+            "Fetched TikTok comments for video %s: top_level=%s replies=%s total_threads=%s",
+            aweme_id,
+            len(results),
+            total_replies,
+            len(results) + total_replies,
+        )
         return results
 
     def fetch_video_metadata_with_yt_dlp(self, video_url: str) -> dict:
@@ -260,6 +270,65 @@ class TikTokCrawler(BaseCrawler):
         except Exception as e:
             self.log.warning(f"yt-dlp metadata extraction failed for {video_url}: {e}")
         return {}
+
+    @staticmethod
+    def _parse_datetime(value: object) -> Optional[datetime.datetime]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.datetime.fromtimestamp(value, tz=datetime.timezone.utc)
+            except Exception:
+                return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return TikTokCrawler._parse_datetime(int(raw))
+        try:
+            return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _video_id_created_at(video_id: object) -> Optional[datetime.datetime]:
+        """TikTok snowflake IDs encode epoch seconds in the first 31 bits."""
+        try:
+            bits = bin(int(str(video_id)))[2:]
+            if len(bits) < 31:
+                return None
+            ts = int(bits[:31], 2)
+            now = int(time.time())
+            if ts < 1_400_000_000 or ts > now + 31_536_000:
+                return None
+            return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        except Exception:
+            return None
+
+    @classmethod
+    def _is_recent_video(cls, video_id: object, metadata: Optional[dict] = None) -> bool:
+        min_dt = cls._parse_datetime(TIKTOK_MIN_CREATED_AT)
+        if not min_dt:
+            return True
+        if min_dt.tzinfo is None:
+            min_dt = min_dt.replace(tzinfo=datetime.timezone.utc)
+
+        metadata = metadata or {}
+        candidates = [
+            metadata.get("timestamp"),
+            metadata.get("release_timestamp"),
+            metadata.get("upload_date"),
+            metadata.get("modified_timestamp"),
+            cls._video_id_created_at(video_id),
+        ]
+        for candidate in candidates:
+            dt = cls._parse_datetime(candidate)
+            if not dt:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt >= min_dt
+        return True
 
     @staticmethod
     def _normalize_text(text: object) -> str:
@@ -390,6 +459,16 @@ class TikTokCrawler(BaseCrawler):
                 await browser.close()
 
             self.log.info(f"Found {len(found_videos)} TikTok videos for keyword '{keyword}'")
+            for idx, video in enumerate(found_videos[:5], start=1):
+                self.log.info(
+                    "  TikTok result %s/%s: id=%s author=%s title=%r url=%s",
+                    idx,
+                    len(found_videos),
+                    video.get("video_id"),
+                    video.get("author"),
+                    video.get("title"),
+                    video.get("url"),
+                )
         except Exception as e:
             self.log.warning(f"TikTok keyword search failed for '{keyword}': {e}")
 
@@ -413,11 +492,33 @@ class TikTokCrawler(BaseCrawler):
         if not self.cookie_string:
             self.log.error("TikTok cookies file cookies.txt is empty or invalid. Comment API calls may fail.")
 
+        self.log.info(
+            "Starting TikTok Neighborhood Crawl. keywords=%s urls=%s max_videos_per_kw=%s max_comments_per_video=%s min_created_at=%s resume=%s",
+            len(keywords or []),
+            len(urls or []),
+            max_videos_per_kw,
+            max_comments_per_video,
+            TIKTOK_MIN_CREATED_AT,
+            resume,
+        )
+        stats = {
+            "keywords": len(keywords or []),
+            "search_results": 0,
+            "work_items": 0,
+            "skipped_existing": 0,
+            "skipped_duplicate_work": 0,
+            "skipped_old": 0,
+            "skipped_unrelated": 0,
+            "processed": 0,
+            "top_comments": 0,
+            "replies": 0,
+        }
+
         all_results = []
         if resume:
             self.checkpoint_mgr.load()
-            all_results = self.checkpoint_mgr.get_processed_items()
-            self.log.info(f"Resumed crawl. Loaded {len(all_results)} existing videos from checkpoints.")
+            all_results = self.load_existing_data() + self.checkpoint_mgr.get_processed_items()
+            self.log.info(f"Resumed crawl. Loaded {len(all_results)} existing videos from output/checkpoints.")
 
         processed_ids = set()
         for item in all_results:
@@ -434,11 +535,30 @@ class TikTokCrawler(BaseCrawler):
             self.log.info(f"Starting TikTok keyword search. Keywords: {keywords}")
             for kw in keywords:
                 search_results = await self.search_videos_by_keyword(kw, max_results=max_videos_per_kw)
+                stats["search_results"] += len(search_results)
+                keyword_added = 0
+                keyword_skipped_existing = 0
+                keyword_skipped_duplicate = 0
                 for sr in search_results:
                     vid_id = sr.get("video_id") or ""
                     if vid_id not in seen_ids_in_work and vid_id not in processed_ids:
                         seen_ids_in_work.add(vid_id)
                         work_items.append(sr)
+                        keyword_added += 1
+                    elif vid_id in processed_ids:
+                        keyword_skipped_existing += 1
+                        stats["skipped_existing"] += 1
+                    else:
+                        keyword_skipped_duplicate += 1
+                        stats["skipped_duplicate_work"] += 1
+                self.log.info(
+                    "TikTok keyword summary: keyword=%r search_results=%s queued=%s skipped_existing=%s skipped_duplicate_in_work=%s",
+                    kw,
+                    len(search_results),
+                    keyword_added,
+                    keyword_skipped_existing,
+                    keyword_skipped_duplicate,
+                )
 
         # 2. Direct URLs
         if urls:
@@ -448,7 +568,12 @@ class TikTokCrawler(BaseCrawler):
                 if vid_id not in seen_ids_in_work and vid_id not in processed_ids:
                     seen_ids_in_work.add(vid_id)
                     work_items.append({"url": url, "video_id": vid_id, "keyword": None})
+                elif vid_id in processed_ids:
+                    stats["skipped_existing"] += 1
+                else:
+                    stats["skipped_duplicate_work"] += 1
 
+        stats["work_items"] = len(work_items)
         self.log.info(f"Starting TikTok Crawl. Total videos to process: {len(work_items)}")
 
         for idx, item in enumerate(work_items):
@@ -478,10 +603,22 @@ class TikTokCrawler(BaseCrawler):
                 continue
 
             if aweme_id in processed_ids:
+                stats["skipped_existing"] += 1
                 continue
 
             # Fetch extra metadata via yt-dlp
             yt_info = self.fetch_video_metadata_with_yt_dlp(url)
+            if not self._is_recent_video(aweme_id, yt_info):
+                created_at = self._video_id_created_at(aweme_id)
+                self.log.info(
+                    "Skipping TikTok video older than %s: created_at=%s url=%s",
+                    TIKTOK_MIN_CREATED_AT,
+                    created_at.isoformat() if created_at else None,
+                    url,
+                )
+                processed_ids.add(aweme_id)
+                stats["skipped_old"] += 1
+                continue
 
             title_candidates = [
                 item.get("title"),
@@ -498,10 +635,20 @@ class TikTokCrawler(BaseCrawler):
                     title or yt_info.get("title") or item.get("title") or url,
                 )
                 processed_ids.add(aweme_id)
+                stats["skipped_unrelated"] += 1
                 continue
 
             # Fetch comments using the cookie REST API
             comments_data = self.fetch_comments_with_replies(aweme_id, max_comments=max_comments_per_video)
+            reply_count = sum(len(c.get("replies") or []) for c in comments_data)
+            self.log.info(
+                "Processed TikTok video summary: id=%s title=%r top_comments=%s replies=%s url=%s",
+                aweme_id,
+                title or yt_info.get("title") or item.get("title"),
+                len(comments_data),
+                reply_count,
+                url,
+            )
 
             # Assemble record
             record = {
@@ -522,6 +669,9 @@ class TikTokCrawler(BaseCrawler):
 
             all_results.append(record)
             processed_ids.add(aweme_id)
+            stats["processed"] += 1
+            stats["top_comments"] += len(comments_data)
+            stats["replies"] += reply_count
 
             # Save checkpoint
             self.checkpoint_mgr.save(idx, [record])
@@ -530,4 +680,18 @@ class TikTokCrawler(BaseCrawler):
             await self.sleep_polite(2.0)
 
         self.save_final_results(all_results, resume)
+        self.log.info(
+            "TikTok crawl summary: keywords=%s search_results=%s queued=%s processed_new=%s skipped_existing=%s skipped_duplicate_in_work=%s skipped_old=%s skipped_unrelated=%s top_comments=%s replies=%s total_records_after_merge=%s",
+            stats["keywords"],
+            stats["search_results"],
+            stats["work_items"],
+            stats["processed"],
+            stats["skipped_existing"],
+            stats["skipped_duplicate_work"],
+            stats["skipped_old"],
+            stats["skipped_unrelated"],
+            stats["top_comments"],
+            stats["replies"],
+            len(all_results),
+        )
         return all_results

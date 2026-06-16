@@ -33,9 +33,16 @@ class ProjectCrawler(BaseCrawler):
 
     async def _wait_for_projects(self, page: Page) -> bool:
         """Wait until project listing elements appear on the page."""
-        for selector in [".js__card", ".re__card-full", "[class*='prj-card']", "a[href*='/du-an-']"]:
+        for selector in [
+            ".js__project-card",
+            ".re__prj-card-full",
+            ".js__card",
+            ".re__card-full",
+            "[class*='prj-card']",
+            "a[href*='/du-an-'][href*='-pj']",
+        ]:
             try:
-                await page.wait_for_selector(selector, timeout=10_000)
+                await page.wait_for_selector(selector, timeout=20_000)
                 return True
             except Exception:
                 continue
@@ -45,20 +52,24 @@ class ProjectCrawler(BaseCrawler):
         """Extract project summary card elements via browser evaluation."""
         return await page.evaluate("""() => {
             const results = [];
-            let cards = document.querySelectorAll('.js__card, .re__card-full, [class*="prj-card"], [data-tracking-id]');
-            if (cards.length === 0) cards = document.querySelectorAll('a[href*="/du-an-"]');
+            let cards = document.querySelectorAll(
+                '.js__project-card, .re__prj-card-full, .js__card, .re__card-full, [class*="prj-card"], [data-tracking-id]'
+            );
+            if (cards.length === 0) cards = document.querySelectorAll('a[href*="/du-an-"][href*="-pj"]');
 
             const seen = new Set();
             for (const card of cards) {
-                const linkEl = card.querySelector('a[href*="/du-an-"], a[href*="-pj"]')
+                const linkEl = card.querySelector('a[href*="/du-an-"][href*="-pj"], a[href*="-pj"]')
                     || (card.tagName === 'A' && card.href && card.href.includes('du-an') ? card : null);
-                const titleEl = card.querySelector('[class*="card-title"], h3, h2, .js__card-title')
-                    || card.querySelector('a[href*="-pj"]');
-                const locEl = card.querySelector('[class*="card-location"], [class*="location"]');
+                const titleEl = card.querySelector('.re__prj-card-title, [class*="card-title"], h3, h2, .js__card-title')
+                    || linkEl;
+                const locEl = card.querySelector('.re__prj-card-location, [class*="card-location"], [class*="location"]');
+                const cfgEls = Array.from(card.querySelectorAll('.re__prj-card-config-value, [class*="config-value"]'));
                 const priceEl = card.querySelector('[class*="config-price"], [class*="price"]');
-                const areaEl = card.querySelector('[class*="config-area"], [class*="area"]');
+                const areaEl = card.querySelector('[class*="config-area"], [class*="area"]') || cfgEls[0];
                 const imgEl = card.querySelector('img[src*="batdongsan"], img[data-src]');
                 const statusEl = card.querySelector('[class*="status"], [class*="badge"]');
+                const summaryEl = card.querySelector('.re__prj-card-summary, [class*="summary"]');
 
                 const href = linkEl ? (linkEl.getAttribute('href') || '') : '';
                 if (!href || seen.has(href) || (!href.includes('pj') && !href.includes('du-an'))) continue;
@@ -71,6 +82,8 @@ class ProjectCrawler(BaseCrawler):
                     dien_tich: areaEl ? areaEl.innerText.trim() : null,
                     trang_thai: statusEl ? statusEl.innerText.trim() : null,
                     url: href,
+                    mo_ta: summaryEl ? summaryEl.innerText.trim() : null,
+                    hinh_anh: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null,
                 });
             }
             return results;
@@ -348,29 +361,42 @@ class ProjectCrawler(BaseCrawler):
             browser = await launch_browser(pw)
             
             for pg in range(start_page, max_pages + 1):
-                context, page = await new_stealth_page(browser)
                 url = PROJECT_URL if pg == 1 else f"{PROJECT_URL}/p{pg}"
-                self.log.info(f"Navigating to projects page {pg}: {url}")
-                
-                if not await goto_safe(page, url):
-                    self.log.warning(f"Failed to navigate to page {pg}. Skipping.")
-                    await context.close()
-                    continue
+                context = None
+                page = None
+                cards = []
 
-                await asyncio.sleep(5)
-                found = await self._wait_for_projects(page)
-                if not found:
-                    self.log.warning("No project cards found. Scrolling half page...")
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                    await asyncio.sleep(2)
+                for page_attempt in range(1, 4):
+                    context, page = await new_stealth_page(browser)
+                    self.log.info(f"Navigating to projects page {pg} (attempt {page_attempt}/3): {url}")
+
+                    if not await goto_safe(page, url):
+                        self.log.warning(f"Failed to navigate to projects page {pg} on attempt {page_attempt}.")
+                        await context.close()
+                        context = None
+                        continue
+
+                    await asyncio.sleep(2 if page_attempt == 1 else 5)
                     found = await self._wait_for_projects(page)
+                    if not found:
+                        self.log.warning("No project cards found. Scrolling half page...")
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                        await asyncio.sleep(4)
+                        found = await self._wait_for_projects(page)
 
-                if not found:
-                    self.log.error(f"Failed to load project cards on page {pg}. Aborting page.")
+                    if found:
+                        cards = await self._extract_project_cards(page)
+                        if cards:
+                            break
+
+                    self.log.warning(f"No extractable project cards on page {pg} attempt {page_attempt}. Retrying...")
                     await context.close()
+                    context = None
+
+                if not cards:
+                    self.log.error(f"Failed to load project cards on page {pg} after retries. Aborting page.")
                     break
 
-                cards = await self._extract_project_cards(page)
                 self.log.info(f"Extracted {len(cards)} project cards from page {pg}")
 
                 page_projects = []
@@ -412,7 +438,8 @@ class ProjectCrawler(BaseCrawler):
                     if (idx + 1) % 5 == 0:
                         self.log.info(f"  Progress: {idx+1}/{len(cards)} on projects page {pg}")
 
-                await context.close()
+                if context:
+                    await context.close()
                 self.checkpoint_mgr.save(pg, page_projects)
                 await self.sleep_polite(REQUEST_DELAY * 2)
 
