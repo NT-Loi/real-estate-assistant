@@ -115,10 +115,6 @@ class Retriever:
         all_docs = self._deduplicate(all_docs)
         result = all_docs[:top_k]
 
-        # Enrich with offline POI context if lifestyle signals are present
-        if lifestyle_signals:
-            result = self._enrich_with_pois(result, lifestyle_signals)
-
         return result
 
     def retrieve_market_report(
@@ -347,103 +343,4 @@ class Retriever:
         return unique
 
     # ---------------------------------------------------------------------------
-    # Lifestyle / POI enrichment
-    # ---------------------------------------------------------------------------
 
-    # Signal key → OSM POI categories to fetch from Postgres
-    _SIGNAL_TO_CATEGORIES: dict[str, list[str]] = {
-        "metro":          ["transit_station"],
-        "school":         ["school"],
-        "hospital":       ["hospital"],
-        "park":           ["park"],
-        "shopping":       ["shopping_mall", "supermarket"],
-        # flood / livability / safety / appreciation / infrastructure:
-        # no POI category — handled via social_neighborhood retrieval
-    }
-
-    # Human-readable Vietnamese category labels for the context string
-    _CATEGORY_LABELS: dict[str, str] = {
-        "transit_station": "Ga/Trạm metro",
-        "school":           "Trường học",
-        "hospital":         "Bệnh viện",
-        "park":             "Công viên",
-        "shopping_mall":    "Trung tâm thương mại",
-        "supermarket":      "Siêu thị",
-    }
-
-    def _enrich_with_pois(
-        self,
-        docs: list[RetrievedDocument],
-        lifestyle_signals: list[str],
-    ) -> list[RetrievedDocument]:
-        """
-        Append offline POI amenity summaries to listing/project documents.
-
-        Executes a single batched Postgres JOIN across all doc IDs — no per-doc
-        query, no external API calls. Silently skips docs with no cached POI rows.
-        """
-        # Collect relevant categories from signals
-        categories: list[str] = []
-        for sig in lifestyle_signals:
-            categories.extend(self._SIGNAL_TO_CATEGORIES.get(sig, []))
-        categories = list(dict.fromkeys(categories))  # dedupe, preserve order
-
-        if not categories:
-            return docs  # no POI-backed signals; social retrieval handles the rest
-
-        # Gather IDs by entity type from listing/project docs only
-        listing_ids = [
-            d.record["id"] for d in docs
-            if d.collection == "listings" and d.record and d.record.get("id")
-        ]
-        project_ids = [
-            d.record["id"] for d in docs
-            if d.collection == "projects" and d.record and d.record.get("id")
-        ]
-
-        # Batch fetch: one query per entity type
-        poi_map: dict[str, list[dict]] = {}
-        if listing_ids:
-            try:
-                poi_map.update(
-                    self._store.pg.fetch_nearby_pois(
-                        listing_ids, entity_type="listing",
-                        categories=categories, top_n_per_category=2,
-                    )
-                )
-            except Exception as e:
-                log.warning(f"POI enrichment failed for listings: {e}")
-        if project_ids:
-            try:
-                poi_map.update(
-                    self._store.pg.fetch_nearby_pois(
-                        project_ids, entity_type="project",
-                        categories=categories, top_n_per_category=2,
-                    )
-                )
-            except Exception as e:
-                log.warning(f"POI enrichment failed for projects: {e}")
-
-        # Append amenity summary to each matching doc
-        for doc in docs:
-            if doc.collection not in ("listings", "projects") or not doc.record:
-                continue
-            entity_id = doc.record.get("id")
-            if not entity_id:
-                continue
-            pois = poi_map.get(entity_id, [])
-            if not pois:
-                continue
-
-            # Build a concise amenity line grouped by category
-            by_cat: dict[str, list[str]] = {}
-            for p in pois:
-                label = self._CATEGORY_LABELS.get(p["category"], p["category"])
-                dist = f"{p['distance_m']}m" if p.get("distance_m") else ""
-                entry = f"{p['name']} ({dist})".strip(" ()")
-                by_cat.setdefault(label, []).append(entry)
-
-            lines = [f"{label}: {', '.join(names)}" for label, names in by_cat.items()]
-            doc.text += "\nTiện ích lân cận: " + " | ".join(lines)
-
-        return docs

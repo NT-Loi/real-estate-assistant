@@ -1,38 +1,224 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { marked } from 'marked';
 
-// --- Money/VND Formatter ---
+const getLeaflet = () => window.L;
+
+const escapeHtml = (value) => String(value ?? '')
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&#039;');
+
+const renderSafeMarkdown = (text) => ({
+  __html: marked.parse(escapeHtml(text || ''), { breaks: true }),
+});
+
 const formatMoney = (vnd) => {
-  if (!vnd) return "Thỏa thuận";
+  if (!vnd) return 'Thỏa thuận';
   if (vnd >= 1_000_000_000) {
-    return `${(vnd / 1_000_000_000).toFixed(1).replace(".0", "")} tỷ`;
+    return `${(vnd / 1_000_000_000).toFixed(1).replace('.0', '')} tỷ`;
   }
   return `${Math.round(vnd / 1_000_000)} triệu`;
 };
 
+const formatMonthlyMoney = (vnd) => {
+  if (!vnd || !Number.isFinite(vnd)) return 'N/A';
+  if (vnd >= 1_000_000_000) return `${(vnd / 1_000_000_000).toFixed(1)} tỷ/tháng`;
+  return `${(vnd / 1_000_000).toFixed(1).replace('.0', '')} triệu/tháng`;
+};
+
+const formatPricePerM2 = (item) => {
+  if (!item?.price_vnd || !item?.area_m2) return 'Chưa đủ dữ liệu';
+  return `${formatMoney(item.price_vnd / item.area_m2)}/m²`;
+};
+
+const listingModeLabel = (item) => (item?.listing_type === 'cho-thue' ? 'Cho thuê' : 'Mua bán');
+
+const geoPrecisionLabel = (value) => (value === 'exact' ? 'Tọa độ chính xác' : 'Vị trí ước lượng');
+
+const poiLabels = {
+  transit_station: 'Giao thông',
+  school: 'Trường học',
+  hospital: 'Y tế',
+  park: 'Công viên',
+};
+
+const promptGroups = [
+  {
+    title: 'Lọc tin chính xác',
+    icon: 'fa-filter',
+    prompt: 'Tìm chung cư bán giá từ 3 đến 5 tỷ ở Quận 2 có 2 phòng ngủ',
+  },
+  {
+    title: 'So sánh dự án',
+    icon: 'fa-code-compare',
+    prompt: 'So sánh căn hộ Feliz En Vista với Estella Heights về giá thuê, diện tích và pháp lý',
+  },
+  {
+    title: 'Tiện ích xung quanh',
+    icon: 'fa-location-dot',
+    prompt: 'Xung quanh dự án Feliz En Vista có trường học, bệnh viện hoặc công viên nào trong bán kính 2km?',
+  },
+  {
+    title: 'Cảm quan cư dân',
+    icon: 'fa-comments',
+    prompt: 'Khu vực Thạnh Mỹ Lợi Quận 2 có bị ngập nước, kẹt xe hoặc ồn vào mùa mưa không?',
+  },
+  {
+    title: 'Tài chính & giá thị trường',
+    icon: 'fa-chart-line',
+    prompt: 'Tôi định mua căn hộ giá 5.5 tỷ cho 80m² ở Thạnh Mỹ Lợi. Mức giá này có hợp lý không?',
+  },
+  {
+    title: 'Thống kê thị trường',
+    icon: 'fa-chart-simple',
+    prompt: 'Cho tôi biết giá trung bình và đơn giá m² của căn hộ chung cư ở Quận 2 hiện tại',
+  },
+];
+
+function RecommendationCard({ item, onSelect, onCompare, selectedForCompare }) {
+  return (
+    <article className="recommendation-card">
+      <div>
+        <div className="recommendation-topline">
+          <span className={`badge-tag ${item.listing_type === 'ban' ? 'sale' : 'rent'}`}>
+            {listingModeLabel(item)}
+          </span>
+          <span className="geo-chip">{geoPrecisionLabel(item.geo_precision)}</span>
+        </div>
+        <h4>{item.title || 'Tin đăng chưa có tiêu đề'}</h4>
+        <p><i className="fa-solid fa-location-dot" /> {item.district || item.province || item.address || 'Chưa rõ vị trí'}</p>
+      </div>
+      <div className="recommendation-metrics">
+        <span><strong>{formatMoney(item.price_vnd)}</strong>Giá</span>
+        <span><strong>{item.area_m2 ? `${item.area_m2} m²` : 'N/A'}</strong>Diện tích</span>
+        <span><strong>{formatPricePerM2(item)}</strong>Đơn giá</span>
+      </div>
+      <p className="match-reason">
+        Phù hợp để kiểm tra nhanh giá, vị trí, tiện ích xung quanh và đối chiếu nguồn RAG.
+      </p>
+      <div className="recommendation-actions">
+        <button type="button" className="btn-api" onClick={() => onSelect(item.id)}>
+          <i className="fa-solid fa-circle-info" /> Xem quyết định
+        </button>
+        <button type="button" className="btn-soft" onClick={() => onCompare(item)}>
+          <i className={`fa-solid ${selectedForCompare ? 'fa-check' : 'fa-scale-balanced'}`} />
+          {selectedForCompare ? 'Đã chọn' : 'So sánh'}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function ListingCard({ item, active, onSelect, onCompare, selectedForCompare }) {
+  return (
+    <article className={`listing-card decision-listing-card ${active ? 'active' : ''}`} onClick={() => onSelect(item.id)}>
+      {item.image ? (
+        <img src={item.image} alt={item.title || 'Bất động sản'} loading="lazy" />
+      ) : (
+        <div className="listing-image-placeholder"><i className="fa-solid fa-image" /></div>
+      )}
+      <div className="listing-info">
+        <div className="listing-title-row">
+          <h3>{item.title || 'Tin đăng chưa có tiêu đề'}</h3>
+          <span className={`badge-tag ${item.listing_type === 'ban' ? 'sale' : 'rent'}`}>{listingModeLabel(item)}</span>
+        </div>
+        <div className="decision-metric-row">
+          <span><strong>{formatMoney(item.price_vnd)}</strong>Giá</span>
+          <span><strong>{item.area_m2 ? `${item.area_m2} m²` : 'N/A'}</strong>Diện tích</span>
+          <span><strong>{formatPricePerM2(item)}</strong>Đơn giá</span>
+        </div>
+        <p className="listing-address"><i className="fa-solid fa-location-dot" /> {item.district || item.address || 'Chưa có địa chỉ'}</p>
+        <div className="listing-quality-row">
+          <span><i className="fa-solid fa-file-shield" /> {item.legal || 'Pháp lý: chưa rõ'}</span>
+          <span><i className="fa-solid fa-location-crosshairs" /> {geoPrecisionLabel(item.geo_precision)}</span>
+        </div>
+        <div className="listing-card-actions" onClick={(event) => event.stopPropagation()}>
+          <button type="button" className="btn-soft" onClick={() => onSelect(item.id)}>
+            <i className="fa-solid fa-magnifying-glass-chart" /> Chi tiết
+          </button>
+          <button type="button" className="btn-soft" onClick={() => onCompare(item)}>
+            <i className={`fa-solid ${selectedForCompare ? 'fa-check' : 'fa-scale-balanced'}`} />
+            {selectedForCompare ? 'Đã chọn' : 'So sánh'}
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function CompareTable({ items, onClose, onSubmitAnalysis }) {
+  const rows = [
+    ['Mức giá', (item) => formatMoney(item.price_vnd)],
+    ['Diện tích', (item) => (item.area_m2 ? `${item.area_m2} m²` : 'N/A')],
+    ['Đơn giá', (item) => formatPricePerM2(item)],
+    ['Vị trí', (item) => item.address || item.district || 'Chưa rõ'],
+    ['Pháp lý', (item) => item.legal || 'Đang cập nhật'],
+    ['Phòng ngủ', (item) => (item.bedrooms ? `${item.bedrooms} PN` : 'N/A')],
+    ['Phòng tắm', (item) => (item.bathrooms ? `${item.bathrooms} WC` : 'N/A')],
+    ['Độ tin cậy vị trí', (item) => geoPrecisionLabel(item.geo_precision)],
+    ['Phù hợp nhất', (item) => (item.listing_type === 'cho-thue' ? 'Tối ưu chi phí thuê & tiện ích sống' : 'Đánh giá mua ở, đầu tư và khả năng vay')],
+  ];
+
+  return (
+    <div className="compare-modal-overlay animate-fade-in" role="dialog" aria-modal="true" aria-label="So sánh bất động sản">
+      <div className="compare-modal-content decision-modal">
+        <div className="modal-header-row">
+          <div>
+            <h2>So sánh 2 bất động sản</h2>
+            <p>Đối chiếu nhanh các yếu tố tác động trực tiếp đến quyết định mua hoặc thuê.</p>
+          </div>
+          <button type="button" className="btn-icon" onClick={onClose} aria-label="Đóng so sánh">
+            <i className="fa-solid fa-times" />
+          </button>
+        </div>
+        <div className="compare-table">
+          <div className="compare-table-row compare-table-head">
+            <span>Tiêu chí</span>
+            <span>{items[0].title || 'BĐS 1'}</span>
+            <span>{items[1].title || 'BĐS 2'}</span>
+          </div>
+          {rows.map(([label, getter]) => (
+            <div className="compare-table-row" key={label}>
+              <span>{label}</span>
+              <strong>{getter(items[0])}</strong>
+              <strong>{getter(items[1])}</strong>
+            </div>
+          ))}
+        </div>
+        <button type="button" className="btn-api modal-primary-action" onClick={onSubmitAnalysis}>
+          <i className="fa-solid fa-robot" /> Nhờ RAG Agent phân tích sâu
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
-  // --- Core Application States ---
   const [activeTab, setActiveTab] = useState('chat');
   const [theme, setTheme] = useState(localStorage.getItem('color-scheme') || 'auto');
-  
   const [allListings, setAllListings] = useState([]);
   const [listings, setListings] = useState([]);
   const [lastChatListings, setLastChatListings] = useState(null);
   const [activeId, setActiveId] = useState(null);
+  const [compareList, setCompareList] = useState([]);
+  const [showCompareModal, setShowCompareModal] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(640);
+  const [isResizing, setIsResizing] = useState(false);
+  const [pendingFitMap, setPendingFitMap] = useState(false);
 
-  // Chat State
   const [chatMessages, setChatMessages] = useState([
     {
       role: 'assistant',
-      text: 'Chào bạn! Hãy đặt câu hỏi về nhu cầu mua/thuê nhà, ngân sách, vị trí mong muốn hoặc yêu cầu phân tích tài chính vay mua nhà.\n\nTôi sẽ phân tích dựa trên dữ liệu RAG thực tế, ghim các vị trí tương ứng trên bản đồ và thống kê chi tiết tiện ích xung quanh.',
-      payload: null
-    }
+      text: 'Chào bạn! Hãy nhập nhu cầu bằng tiếng Việt tự nhiên, ví dụ: tìm chung cư yên tĩnh, gần metro, có trường học và ít ngập nước.\n\nTôi sẽ dùng RAG để truy xuất tin đăng, tiện ích xung quanh, đánh giá cộng đồng và dữ liệu tài chính liên quan.',
+      payload: null,
+    },
   ]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [ragStatus, setRagStatus] = useState({ label: 'RAG', isError: false });
 
-  // Filters State
   const [searchQuery, setSearchQuery] = useState('');
   const [listingType, setListingType] = useState('');
   const [provinceSelect, setProvinceSelect] = useState('');
@@ -43,52 +229,62 @@ export default function App() {
   const [bedsSelect, setBedsSelect] = useState('');
   const [sortBy, setSortBy] = useState('');
   const [ragFilterOnly, setRagFilterOnly] = useState(false);
-
-  // Provinces List
   const [provinces, setProvinces] = useState([]);
 
-  // Active Listing Detail & POIs State
   const [pois, setPois] = useState([]);
   const [isPoisLoading, setIsPoisLoading] = useState(false);
-
-  // Mortgage Calculator State
   const [downPaymentPct, setDownPaymentPct] = useState(30);
-  const [interestRate, setInterestRate] = useState(9.0);
+  const [interestRate, setInterestRate] = useState(9);
   const [loanTermYears, setLoanTermYears] = useState(20);
   const [monthlyIncome, setMonthlyIncome] = useState('');
 
-  // Map Refs
   const mapRef = useRef(null);
   const markerLayerRef = useRef(null);
   const poiLayerRef = useRef(null);
   const circleRef = useRef(null);
   const markersMapRef = useRef(new Map());
 
-  // --- Initialize theme ---
+  useEffect(() => {
+    if (!isResizing) return undefined;
+    const handlePointerMove = (event) => {
+      const newWidth = event.clientX - 96;
+      if (newWidth >= 460 && newWidth <= 960) setSidebarWidth(newWidth);
+    };
+    const handlePointerUp = () => {
+      setIsResizing(false);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', handlePointerUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    return () => {
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', handlePointerUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [isResizing]);
+
   useEffect(() => {
     const meta = document.querySelector('meta[name="color-scheme"]');
-    if (theme === 'auto') {
-      const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      meta.content = isDark ? 'dark' : 'light';
-      document.documentElement.setAttribute('content', isDark ? 'dark' : 'light');
-    } else {
-      meta.content = theme;
-      document.documentElement.setAttribute('content', theme);
-    }
+    const resolvedTheme = theme === 'auto'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      : theme;
+    if (meta) meta.content = resolvedTheme;
+    document.documentElement.setAttribute('content', resolvedTheme);
     localStorage.setItem('color-scheme', theme);
   }, [theme]);
 
-  // --- Fetch initial catalog listings ---
   useEffect(() => {
     async function loadCatalog() {
       try {
         const res = await fetch('/api/listings');
         const payload = await res.json();
-        setAllListings(payload.items);
-        
-        // Extract unique provinces
-        const uniqueProvinces = [...new Set(payload.items.map(i => i.province).filter(Boolean))].sort();
-        setProvinces(uniqueProvinces);
+        const items = payload.items || [];
+        setAllListings(items);
+        setProvinces([...new Set(items.map((item) => item.province).filter(Boolean))].sort());
       } catch (err) {
         console.error('Failed to load listings catalog:', err);
       }
@@ -96,12 +292,9 @@ export default function App() {
     loadCatalog();
   }, []);
 
-  // --- Apply dynamic filters whenever search parameters update ---
   useEffect(() => {
     let source = allListings;
-    if (ragFilterOnly && lastChatListings) {
-      source = lastChatListings;
-    }
+    if (ragFilterOnly && lastChatListings) source = lastChatListings;
 
     const minPriceVal = parseFloat(minPrice) * 1_000_000_000 || 0;
     const maxPriceVal = parseFloat(maxPrice) * 1_000_000_000 || Infinity;
@@ -109,322 +302,320 @@ export default function App() {
     const maxAreaVal = parseFloat(maxArea) || Infinity;
     const q = searchQuery.trim().toLowerCase();
 
-    let filtered = source.filter(item => {
+    const filtered = source.filter((item) => {
       if (listingType && item.listing_type !== listingType) return false;
       if (provinceSelect && item.province !== provinceSelect) return false;
-
-      const price = item.price_vnd || 0;
-      if (price && (price < minPriceVal || price > maxPriceVal)) return false;
-
-      const area = item.area_m2 || 0;
-      if (area && (area < minAreaVal || area > maxAreaVal)) return false;
-
-      if (bedsSelect) {
-        if (bedsSelect === '4') {
-          if (!item.bedrooms || item.bedrooms < 4) return false;
-        } else {
-          if (!item.bedrooms || parseInt(item.bedrooms) !== parseInt(bedsSelect)) return false;
-        }
-      }
-
+      if (item.price_vnd && (item.price_vnd < minPriceVal || item.price_vnd > maxPriceVal)) return false;
+      if (item.area_m2 && (item.area_m2 < minAreaVal || item.area_m2 > maxAreaVal)) return false;
+      if (bedsSelect === '4' && (!item.bedrooms || item.bedrooms < 4)) return false;
+      if (bedsSelect && bedsSelect !== '4' && (!item.bedrooms || parseInt(item.bedrooms, 10) !== parseInt(bedsSelect, 10))) return false;
       if (q) {
-        const haystack = [item.title, item.address, item.project, item.property_type, item.district]
-          .join(" ").toLowerCase();
+        const haystack = [item.title, item.address, item.project, item.property_type, item.district].join(' ').toLowerCase();
         if (!haystack.includes(q)) return false;
       }
-
       return true;
     });
 
-    // Sort listings
-    if (sortBy === 'price_asc') {
-      filtered.sort((a, b) => (a.price_vnd || Infinity) - (b.price_vnd || Infinity));
-    } else if (sortBy === 'price_desc') {
-      filtered.sort((a, b) => (b.price_vnd || 0) - (a.price_vnd || 0));
-    } else if (sortBy === 'area_desc') {
-      filtered.sort((a, b) => (b.area_m2 || 0) - (a.area_m2 || 0));
-    }
+    if (sortBy === 'price_asc') filtered.sort((a, b) => (a.price_vnd || Infinity) - (b.price_vnd || Infinity));
+    if (sortBy === 'price_desc') filtered.sort((a, b) => (b.price_vnd || 0) - (a.price_vnd || 0));
+    if (sortBy === 'area_desc') filtered.sort((a, b) => (b.area_m2 || 0) - (a.area_m2 || 0));
 
     setListings(filtered);
   }, [allListings, lastChatListings, searchQuery, listingType, provinceSelect, minPrice, maxPrice, minArea, maxArea, bedsSelect, sortBy, ragFilterOnly]);
 
-  // --- Leaflet Map Init effect ---
   useEffect(() => {
-    if (!mapRef.current) {
-      const leafletMap = L.map('map', { zoomControl: false }).setView([10.7769, 106.7009], 12);
-      
-      L.control.zoom({ position: 'bottomright' }).addTo(leafletMap);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-      }).addTo(leafletMap);
-
-      markerLayerRef.current = L.layerGroup().addTo(leafletMap);
-      poiLayerRef.current = L.layerGroup().addTo(leafletMap);
-      mapRef.current = leafletMap;
-    }
+    const L = getLeaflet();
+    if (!L || mapRef.current) return;
+    const leafletMap = L.map('map', { zoomControl: false }).setView([10.7769, 106.7009], 12);
+    L.control.zoom({ position: 'bottomright' }).addTo(leafletMap);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    }).addTo(leafletMap);
+    markerLayerRef.current = L.layerGroup().addTo(leafletMap);
+    poiLayerRef.current = L.layerGroup().addTo(leafletMap);
+    mapRef.current = leafletMap;
   }, []);
 
-  // --- Render markers on map when listings or active selection changes ---
+  const handleSelectListing = useCallback((id, openPopup = true) => {
+    setActiveId(id);
+    setActiveTab('details');
+    const item = allListings.find((listing) => listing.id === id);
+    if (item?.lat && item?.lng && mapRef.current) {
+      mapRef.current.panTo([item.lat, item.lng], { animate: true });
+      const marker = markersMapRef.current.get(id);
+      if (marker && openPopup) marker.openPopup();
+    }
+  }, [allListings]);
+
   useEffect(() => {
-    if (!mapRef.current) return;
-    
+    const L = getLeaflet();
+    if (!L || !mapRef.current || !markerLayerRef.current) return;
+
     markerLayerRef.current.clearLayers();
     markersMapRef.current.clear();
 
-    listings.forEach(item => {
+    listings.forEach((item) => {
       if (!item.lat || !item.lng) return;
-
-      const isActive = item.id === activeId;
-      
-      // Setup divIcon wrapper
-      const iconClass = isActive ? "pin-marker active" : "pin-marker";
-      const rentClass = item.listing_type === 'cho-thue' ? " rent" : "";
+      const iconClass = item.id === activeId ? 'pin-marker active' : 'pin-marker';
+      const rentClass = item.listing_type === 'cho-thue' ? ' rent' : '';
       const iconChar = item.listing_type === 'cho-thue' ? '<i class="fa-solid fa-key"></i>' : '<i class="fa-solid fa-house"></i>';
-      
+      const popupHtml = `
+        <div class="map-popup">
+          <h3>${escapeHtml(item.title || 'Tin đăng')}</h3>
+          <div class="popup-meta">
+            <span class="badge-tag ${item.listing_type === 'ban' ? 'sale' : 'rent'}">${escapeHtml(listingModeLabel(item))}</span>
+            <span class="badge-tag price">${escapeHtml(formatMoney(item.price_vnd))}</span>
+            ${item.area_m2 ? `<span class="badge-tag">${escapeHtml(item.area_m2)} m²</span>` : ''}
+          </div>
+          <p>${escapeHtml(item.address || 'Chưa có địa chỉ')}</p>
+          <small>${escapeHtml(geoPrecisionLabel(item.geo_precision))}</small>
+        </div>
+      `;
+
       const customIcon = L.divIcon({
         className: '',
         html: `<div class="${iconClass}${rentClass}">${iconChar}</div>`,
         iconSize: [32, 32],
         iconAnchor: [16, 32],
-        popupAnchor: [0, -32]
+        popupAnchor: [0, -32],
       });
-
-      const popupHtml = `
-        <div style="min-width: 200px; padding: 4px 0;">
-          <h3 style="margin: 0 0 6px; font-size: 13px; font-weight: 700; line-height: 1.4;">${item.title}</h3>
-          <div class="popup-meta" style="margin-bottom: 6px;">
-            <span class="badge-tag ${item.listing_type === 'ban' ? 'sale' : 'rent'}">
-              ${item.listing_type === 'ban' ? 'Bán' : 'Thuê'}
-            </span>
-            <span class="badge-tag price">${formatMoney(item.price_vnd)}</span>
-            ${item.area_m2 ? `<span class="badge-tag">${item.area_m2} m²</span>` : ''}
-          </div>
-          <p style="margin: 0 0 8px; font-size: 11px; color: var(--text-muted-raw);">${item.address}</p>
-        </div>
-      `;
-
       const marker = L.marker([item.lat, item.lng], { icon: customIcon })
         .bindPopup(popupHtml)
         .on('click', () => handleSelectListing(item.id, false));
-
       marker.addTo(markerLayerRef.current);
       markersMapRef.current.set(item.id, marker);
     });
-  }, [listings, activeId]);
+  }, [listings, activeId, handleSelectListing]);
 
-  // --- Selection circle effect ---
   useEffect(() => {
-    if (!mapRef.current) return;
-    
+    const L = getLeaflet();
+    if (!L || !mapRef.current) return;
     if (circleRef.current) {
       mapRef.current.removeLayer(circleRef.current);
       circleRef.current = null;
     }
-
-    const activeItem = allListings.find(l => l.id === activeId);
-    if (activeItem && activeItem.lat && activeItem.lng) {
-      const circle = L.circle([activeItem.lat, activeItem.lng], {
+    const activeItem = allListings.find((listing) => listing.id === activeId);
+    if (activeItem?.lat && activeItem?.lng) {
+      circleRef.current = L.circle([activeItem.lat, activeItem.lng], {
         radius: 1500,
         color: 'hsl(var(--primary-raw))',
         fillColor: 'hsl(var(--primary-raw))',
         fillOpacity: 0.04,
         weight: 1.5,
-        dashArray: '4 4'
+        dashArray: '4 4',
       }).addTo(mapRef.current);
-
-      circleRef.current = circle;
     }
   }, [activeId, allListings]);
 
-  // --- Fetch and plot POIs when active listing changes ---
   useEffect(() => {
+    const L = getLeaflet();
     if (!activeId) {
       setPois([]);
       if (poiLayerRef.current) poiLayerRef.current.clearLayers();
       return;
     }
 
+    let isMounted = true;
     async function loadPois() {
       setIsPoisLoading(true);
       if (poiLayerRef.current) poiLayerRef.current.clearLayers();
-
       try {
         const res = await fetch(`/api/listings/${encodeURIComponent(activeId)}/pois`);
         const payload = await res.json();
         const foundPois = payload.pois || [];
+        if (!isMounted) return;
         setPois(foundPois);
-
-        // Plot POIs on map
-        foundPois.forEach(poi => {
+        if (!L || !poiLayerRef.current) return;
+        foundPois.forEach((poi) => {
           if (!poi.lat || !poi.lng) return;
-
-          let iconHtml = '<i class="fa-solid fa-location-dot"></i>';
-          if (poi.category === 'transit_station') iconHtml = '<i class="fa-solid fa-train-subway"></i>';
-          else if (poi.category === 'school') iconHtml = '<i class="fa-solid fa-graduation-cap"></i>';
-          else if (poi.category === 'hospital') iconHtml = '<i class="fa-solid fa-house-medical"></i>';
-          else if (poi.category === 'park') iconHtml = '<i class="fa-solid fa-tree"></i>';
-
+          const iconByCategory = {
+            transit_station: 'fa-train-subway',
+            school: 'fa-graduation-cap',
+            hospital: 'fa-house-medical',
+            park: 'fa-tree',
+          };
           const customIcon = L.divIcon({
             className: '',
-            html: `<div class="poi-marker ${poi.category}">${iconHtml}</div>`,
+            html: `<div class="poi-marker ${escapeHtml(poi.category)}"><i class="fa-solid ${iconByCategory[poi.category] || 'fa-location-dot'}"></i></div>`,
             iconSize: [22, 22],
-            iconAnchor: [11, 11]
+            iconAnchor: [11, 11],
           });
-
           L.marker([poi.lat, poi.lng], { icon: customIcon })
-            .bindPopup(`<strong>${poi.name}</strong><br><small style="color:var(--text-muted-raw);">${poi.address || ''}</small>`)
+            .bindPopup(`<strong>${escapeHtml(poi.name)}</strong><br><small>${escapeHtml(poi.address || '')}</small>`)
             .addTo(poiLayerRef.current);
         });
-
       } catch (err) {
         console.error('Failed to load POIs:', err);
+        if (isMounted) setPois([]);
       } finally {
-        setIsPoisLoading(false);
+        if (isMounted) setIsPoisLoading(false);
       }
     }
     loadPois();
+    return () => {
+      isMounted = false;
+    };
   }, [activeId]);
 
-  // --- Fit map bounds ---
-  const handleFitMap = () => {
+  const handleFitMap = useCallback(() => {
+    const L = getLeaflet();
     const activeMarkers = [...markersMapRef.current.values()];
-    if (!activeMarkers.length || !mapRef.current) return;
-    const bounds = L.latLngBounds(activeMarkers.map(m => m.getLatLng()));
+    if (!L || !activeMarkers.length || !mapRef.current) return;
+    const bounds = L.latLngBounds(activeMarkers.map((marker) => marker.getLatLng()));
     mapRef.current.fitBounds(bounds.pad(0.15), { maxZoom: 14 });
+  }, []);
+
+  useEffect(() => {
+    if (!pendingFitMap) return;
+    const timer = window.setTimeout(() => {
+      handleFitMap();
+      setPendingFitMap(false);
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [pendingFitMap, listings, handleFitMap]);
+
+  const activeListing = useMemo(() => allListings.find((listing) => listing.id === activeId), [allListings, activeId]);
+
+  const loanPrincipal = (activeListing?.price_vnd || 0) * (1 - downPaymentPct / 100);
+  const monthlyInterestRate = (Number(interestRate) / 100) / 12;
+  const loanTermMonths = Number(loanTermYears) * 12;
+  const monthlyMortgagePayment = loanPrincipal > 0 && loanTermMonths > 0
+    ? monthlyInterestRate > 0
+      ? loanPrincipal * (monthlyInterestRate * (1 + monthlyInterestRate) ** loanTermMonths) / (((1 + monthlyInterestRate) ** loanTermMonths) - 1)
+      : loanPrincipal / loanTermMonths
+    : 0;
+  const totalInterestPayable = (monthlyMortgagePayment * loanTermMonths) - loanPrincipal;
+  const incomeRatio = Number(monthlyIncome) > 0 && monthlyMortgagePayment > 0
+    ? (monthlyMortgagePayment / (Number(monthlyIncome) * 1_000_000)) * 100
+    : null;
+  const affordabilityLevel = incomeRatio === null ? 'neutral' : incomeRatio <= 40 ? 'success' : incomeRatio <= 60 ? 'warning' : 'danger';
+
+  const setPrompt = (prompt) => {
+    setChatInput(prompt);
+    setActiveTab('chat');
   };
 
-  // --- Select a listing card / pin ---
-  const handleSelectListing = (id, openPopup = true) => {
-    setActiveId(id);
-    setActiveTab('details');
-
-    const item = allListings.find(l => l.id === id);
-    if (item && mapRef.current) {
-      mapRef.current.panTo([item.lat, item.lng], { animate: true });
-      const marker = markersMapRef.current.get(id);
-      if (marker && openPopup) {
-        marker.openPopup();
-      }
-    }
+  const toggleCompare = (item) => {
+    setCompareList((current) => {
+      if (current.some((candidate) => candidate.id === item.id)) return current.filter((candidate) => candidate.id !== item.id);
+      if (current.length >= 2) return [current[1], item];
+      return [...current, item];
+    });
   };
 
-  // --- Submit user chat queries ---
-  const handleChatSubmit = async (e) => {
-    if (e) e.preventDefault();
-    const cleanMsg = chatInput.trim();
+  const buildComparePrompt = (items = compareList) => {
+    if (items.length !== 2) return '';
+    return `Hãy so sánh chi tiết 2 bất động sản sau và đưa ra khuyến nghị dựa trên giá, diện tích, pháp lý, vị trí, tiện ích xung quanh, cảm quan cư dân và khả năng tài chính:\n\nBĐS 1: ${items[0].title}\n- Giá: ${formatMoney(items[0].price_vnd)}\n- Diện tích: ${items[0].area_m2 || 'N/A'} m²\n- Đơn giá: ${formatPricePerM2(items[0])}\n- Vị trí: ${items[0].address || 'N/A'}\n- Pháp lý: ${items[0].legal || 'Đang cập nhật'}\n\nBĐS 2: ${items[1].title}\n- Giá: ${formatMoney(items[1].price_vnd)}\n- Diện tích: ${items[1].area_m2 || 'N/A'} m²\n- Đơn giá: ${formatPricePerM2(items[1])}\n- Vị trí: ${items[1].address || 'N/A'}\n- Pháp lý: ${items[1].legal || 'Đang cập nhật'}`;
+  };
+
+  const handleChatSubmit = async (event, overrideMessage) => {
+    if (event) event.preventDefault();
+    const cleanMsg = (overrideMessage ?? chatInput).trim();
     if (!cleanMsg || isChatLoading) return;
 
-    setChatMessages(prev => [...prev, { role: 'user', text: cleanMsg }]);
+    setChatMessages((prev) => [
+      ...prev,
+      { role: 'user', text: cleanMsg },
+      { role: 'assistant', text: '', streaming: true, thinkingProcess: [], statusText: null, payload: null },
+    ]);
     setChatInput('');
     setIsChatLoading(true);
-
-    // Placeholder assistant message index — will be updated as chunks arrive
-    let assistantMsgIndex = null;
+    setActiveTab('chat');
 
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: cleanMsg })
+        body: JSON.stringify({ message: cleanMsg }),
       });
-
-      if (!res.ok || !res.body) {
-        throw new Error(`Server error: ${res.status}`);
-      }
+      if (!res.ok || !res.body) throw new Error(`Server error: ${res.status}`);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      let currentEvent = null;
+      let streamDone = false;
 
-      while (true) {
+      while (!streamDone) {
         const { value, done } = await reader.read();
         if (done) break;
-
         buffer += decoder.decode(value, { stream: true });
-
-        // Process complete SSE messages (separated by double newline)
         const messages = buffer.split('\n\n');
-        buffer = messages.pop(); // Keep the last incomplete part in the buffer
+        buffer = messages.pop() || '';
 
         for (const rawMsg of messages) {
           if (!rawMsg.trim()) continue;
-
-          // Parse SSE fields
           const lines = rawMsg.split('\n');
-          let eventType = null;
-          let dataStr = null;
-
-          for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              eventType = line.slice('event: '.length).trim();
-            } else if (line.startsWith('data: ')) {
-              dataStr = line.slice('data: '.length).trim();
-            }
-          }
-
+          const eventType = lines.find((line) => line.startsWith('event: '))?.slice(7).trim();
+          const dataStr = lines.find((line) => line.startsWith('data: '))?.slice(6).trim();
           if (!eventType || !dataStr) continue;
 
           if (eventType === 'metadata') {
             const meta = JSON.parse(dataStr);
-            // Insert placeholder assistant message
-            setChatMessages(prev => {
-              assistantMsgIndex = prev.length;
-              return [...prev, {
-                role: 'assistant',
-                text: '',
-                payload: meta,
-                isError: Boolean(meta.error),
-                streaming: true,
-              }];
+            setChatMessages((prev) => {
+              const updated = [...prev];
+              const lastIdx = updated.length - 1;
+              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                updated[lastIdx] = { ...updated[lastIdx], payload: meta, isError: Boolean(meta.error) };
+              }
+              return updated;
             });
             setRagStatus({ label: meta.error ? 'Fallback' : 'RAG', isError: Boolean(meta.error) });
-
-            // Save listings returned from RAG
-            if (meta.listings && meta.listings.length) {
-              const ids = new Set(meta.listings.map(l => l.id));
-              setLastChatListings(allListings.filter(i => ids.has(i.id)));
+            if (meta.listings?.length) {
+              const ids = new Set(meta.listings.map((listing) => listing.id));
+              setLastChatListings(allListings.filter((item) => ids.has(item.id)));
             } else {
               setLastChatListings(null);
             }
-
-          } else if (eventType === 'chunk') {
-            const token = JSON.parse(dataStr);
-            // Append token to the streaming assistant message
-            setChatMessages(prev => {
+          } else if (eventType === 'thought' || eventType === 'observation') {
+            const text = JSON.parse(dataStr);
+            setChatMessages((prev) => {
               const updated = [...prev];
               const lastIdx = updated.length - 1;
               if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
                 updated[lastIdx] = {
                   ...updated[lastIdx],
-                  text: updated[lastIdx].text + token,
+                  thinkingProcess: [...(updated[lastIdx].thinkingProcess || []), { type: eventType, text }],
                 };
               }
               return updated;
             });
-
-          } else if (eventType === 'done') {
-            // Mark streaming complete
-            setChatMessages(prev => {
+          } else if (eventType === 'status') {
+            const statusMsg = JSON.parse(dataStr);
+            setChatMessages((prev) => {
+              const updated = [...prev];
+              const lastIdx = updated.length - 1;
+              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') updated[lastIdx] = { ...updated[lastIdx], statusText: statusMsg };
+              return updated;
+            });
+          } else if (eventType === 'chunk') {
+            const token = JSON.parse(dataStr);
+            setChatMessages((prev) => {
               const updated = [...prev];
               const lastIdx = updated.length - 1;
               if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
-                updated[lastIdx] = { ...updated[lastIdx], streaming: false };
+                updated[lastIdx] = { ...updated[lastIdx], text: updated[lastIdx].text + token, statusText: null };
               }
               return updated;
             });
+          } else if (eventType === 'done') {
+            setChatMessages((prev) => {
+              const updated = [...prev];
+              const lastIdx = updated.length - 1;
+              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') updated[lastIdx] = { ...updated[lastIdx], streaming: false, statusText: null };
+              return updated;
+            });
+            streamDone = true;
             break;
           }
         }
       }
-
     } catch (err) {
       console.error('Chat submit failed:', err);
-      setChatMessages(prev => [...prev, {
+      setChatMessages((prev) => [...prev, {
         role: 'assistant',
         text: `Lỗi kết nối RAG server: ${err.message}`,
-        isError: true
+        isError: true,
       }]);
       setRagStatus({ label: 'Offline', isError: true });
     } finally {
@@ -432,168 +623,146 @@ export default function App() {
     }
   };
 
-  // Focus matching listings returned from RAG chat
   const handleFocusRAGListings = () => {
     setActiveTab('search');
     setRagFilterOnly(true);
-    handleFitMap();
+    setPendingFitMap(true);
   };
 
-  // --- Financial / Mortgage calculations ---
-  const activeListing = allListings.find(l => l.id === activeId);
-  const listingPrice = activeListing?.price_vnd || 0;
-  const loanPrincipal = listingPrice * (1 - downPaymentPct / 100);
-  const monthlyInterestRate = (interestRate / 100) / 12;
-  const loanTermMonths = loanTermYears * 12;
-
-  let monthlyMortgagePayment = 0;
-  if (monthlyInterestRate > 0 && loanPrincipal > 0) {
-    monthlyMortgagePayment = loanPrincipal * (monthlyInterestRate * Math.pow(1 + monthlyInterestRate, loanTermMonths)) / (Math.pow(1 + monthlyInterestRate, loanTermMonths) - 1);
-  } else if (loanPrincipal > 0) {
-    monthlyMortgagePayment = loanPrincipal / loanTermMonths;
-  }
-  const totalInterestPayable = (monthlyMortgagePayment * loanTermMonths) - loanPrincipal;
-
-  // Affordability Check
-  let affordabilityAlert = null;
-  if (monthlyIncome > 0 && monthlyMortgagePayment > 0) {
-    const pct = (monthlyMortgagePayment / (monthlyIncome * 1_000_000)) * 100;
-    if (pct <= 40) {
-      affordabilityAlert = {
-        type: 'success',
-        html: `<i class="fa-solid fa-circle-check"></i> Khoản vay an toàn. Chi phí thanh toán chiếm <strong>${pct.toFixed(0)}%</strong> thu nhập hàng tháng.`
-      };
-    } else if (pct <= 60) {
-      affordabilityAlert = {
-        type: 'warning',
-        html: `<i class="fa-solid fa-triangle-exclamation"></i> Cảnh báo: Chi trả chiếm <strong>${pct.toFixed(0)}%</strong> thu nhập. Khá rủi ro tài chính.`
-      };
-    } else {
-      affordabilityAlert = {
-        type: 'danger',
-        html: `<i class="fa-solid fa-circle-xmark"></i> Vượt khả năng chi trả: Gốc + lãi chiếm <strong>${pct.toFixed(0)}%</strong> thu nhập.`
-      };
-    }
-  }
+  const handleSubmitCompare = () => {
+    const prompt = buildComparePrompt();
+    setShowCompareModal(false);
+    handleChatSubmit(null, prompt);
+  };
 
   return (
-    <div class="app-shell">
-      {/* 1. Far-left Navigation Bar */}
-      <nav class="sidebar-nav" aria-label="Menu chức năng">
-        <div class="nav-top">
-          <button 
-            className={`nav-item ${activeTab === 'chat' ? 'active' : ''}`}
-            onClick={() => setActiveTab('chat')}
-            title="Trợ lý AI (Chat)"
-          >
-            <i class="fa-solid fa-robot"></i>
-            <span>Chat</span>
-          </button>
-          <button 
-            className={`nav-item ${activeTab === 'search' ? 'active' : ''}`}
-            onClick={() => setActiveTab('search')}
-            title="Tìm kiếm & Bộ lọc"
-          >
-            <i class="fa-solid fa-magnifying-glass"></i>
-            <span>Tìm kiếm</span>
-          </button>
-          <button 
-            className={`nav-item ${activeTab === 'details' ? 'active' : ''}`}
-            onClick={() => setActiveTab('details')}
-            title="Chi tiết BĐS"
-          >
-            <i class="fa-solid fa-circle-info"></i>
-            <span>Chi tiết</span>
-          </button>
+    <div className="app-shell" style={{ '--panel-width': `${sidebarWidth}px` }}>
+      <nav className="sidebar-nav" aria-label="Menu chức năng">
+        <div className="nav-top">
+          {[
+            ['chat', 'fa-robot', 'Chat'],
+            ['search', 'fa-magnifying-glass', 'Tìm kiếm'],
+            ['details', 'fa-circle-info', 'Chi tiết'],
+          ].map(([tab, icon, label]) => (
+            <button key={tab} type="button" className={`nav-item ${activeTab === tab ? 'active' : ''}`} onClick={() => setActiveTab(tab)} title={label}>
+              <i className={`fa-solid ${icon}`} />
+              <span>{label}</span>
+            </button>
+          ))}
         </div>
-        <div class="nav-bottom">
-          <button 
-            class="nav-item" 
-            onClick={() => setTheme(prev => prev === 'dark' ? 'light' : prev === 'light' ? 'auto' : 'dark')}
-            title={`Giao diện: ${theme}`}
-          >
-            <i class="fa-solid fa-circle-half-stroke"></i>
+        <div className="nav-bottom">
+          <button type="button" className="nav-item" onClick={() => setTheme((prev) => prev === 'dark' ? 'light' : prev === 'light' ? 'auto' : 'dark')} title={`Giao diện: ${theme}`}>
+            <i className="fa-solid fa-circle-half-stroke" />
             <span>Giao diện</span>
           </button>
         </div>
       </nav>
 
-      {/* 2. Sidebar Panel Content */}
-      <aside class="sidebar-panel">
-        
-        {/* TAB 1: CHAT PANEL */}
+      <aside className="sidebar-panel">
         {activeTab === 'chat' && (
-          <section id="chatTab" class="tab-content active" aria-label="Trợ lý chat">
-            <header class="panel-header">
+          <section id="chatTab" className="tab-content active" aria-label="Trợ lý chat">
+            <header className="panel-header rag-first-header">
               <div>
-                <h1>Trợ lý BĐS AI</h1>
-                <p>RAG Agent hỗ trợ phân tích pháp lý, vị trí, tài chính & tiện ích.</p>
+                <h1>Trợ lý BĐS RAG</h1>
+                <p>Hiểu nhu cầu tự nhiên, truy xuất nguồn tin, POIs, cộng đồng và tài chính.</p>
               </div>
               <span className={`status-pill ${ragStatus.isError ? 'error' : ''}`}>{ragStatus.label}</span>
             </header>
 
-            <div class="suggested-prompts-container" aria-label="Gợi ý câu hỏi">
-              <button type="button" class="btn-prompt" onClick={() => { setChatInput('Căn hộ 2PN dưới 3 tỷ ở TP.HCM, gần metro'); }}>Căn hộ 2PN dưới 3 tỷ ở TP.HCM, gần metro</button>
-              <button type="button" class="btn-prompt" onClick={() => { setChatInput('Khu vực nào ít ngập nước, có trường học tốt?'); }}>Khu vực nào ít ngập nước, có trường học tốt?</button>
-              <button type="button" class="btn-prompt" onClick={() => { setChatInput('Tôi có 3 tỷ, trả trước 30%, tính gói vay mua nhà 15 năm'); }}>Tôi có 3 tỷ, trả trước 30%, tính gói vay mua nhà 15 năm</button>
-              <button type="button" class="btn-prompt" onClick={() => { setChatInput('Dự án nào có tiềm năng tăng giá quanh Thủ Đức?'); }}>Dự án nào có tiềm năng tăng giá quanh Thủ Đức?</button>
+            <div className="prompt-group-grid" aria-label="Gợi ý câu hỏi theo năng lực">
+              {promptGroups.map((group) => (
+                <button key={group.title} type="button" className="prompt-group-card" onClick={() => setPrompt(group.prompt)}>
+                  <i className={`fa-solid ${group.icon}`} />
+                  <span>{group.title}</span>
+                </button>
+              ))}
             </div>
 
-            <div class="chat-messages-container" aria-live="polite">
+            <div className="chat-messages-container" aria-live="polite">
               {chatMessages.map((msg, index) => (
-                <article key={index} className={`message ${msg.role} ${msg.isError ? 'error' : ''} animate-fade-in`}>
-                  <div class="message-header">
-                    <div class="avatar">
-                      {msg.role === 'user' ? <i class="fa-solid fa-user"></i> : <i class="fa-solid fa-robot"></i>}
+                <article key={`${msg.role}-${index}`} className={`message ${msg.role} ${msg.isError ? 'error' : ''} animate-fade-in`}>
+                  <div className="message-header">
+                    <div className="avatar">
+                      <i className={`fa-solid ${msg.role === 'user' ? 'fa-user' : 'fa-robot'}`} />
                     </div>
-                    <span class="sender-label">{msg.role === 'user' ? 'Khách hàng' : 'Trợ lý AI'}</span>
+                    <span className="sender-label">{msg.role === 'user' ? 'Khách hàng' : 'Trợ lý AI'}</span>
                     {msg.streaming && (
-                      <span class="streaming-badge"><i class="fa-solid fa-circle-notch fa-spin"></i> Đang tạo...</span>
+                      <span className="streaming-badge"><i className="fa-solid fa-circle-notch fa-spin" /> {msg.statusText || 'Đang tạo...'}</span>
                     )}
                   </div>
-                  <div class="message-body">
+                  <div className="message-body">
                     {msg.role === 'user' ? (
                       <p>{msg.text}</p>
-                    ) : msg.text ? (
-                      <div>
-                        <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.text) }} />
-                        {msg.streaming && <span class="stream-cursor">▌</span>}
-                      </div>
-                    ) : msg.streaming ? (
-                      <div class="typing-dots">
-                        <span></span><span></span><span></span>
-                      </div>
                     ) : (
-                      <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.text || '') }} />
+                      <>
+                        {msg.thinkingProcess?.length > 0 && (
+                          <details className="thinking-process-panel">
+                            <summary><i className="fa-solid fa-brain" /> Luồng ReAct</summary>
+                            <div className="thinking-content">
+                              {msg.thinkingProcess.map((step, idx) => (
+                                <div key={`${step.type}-${idx}`} className={`think-step ${step.type}`}>
+                                  <strong>{step.type === 'thought' ? 'Agent' : 'System'}:</strong>
+                                  <pre>{step.text}</pre>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
+                        {msg.text ? (
+                          <div>
+                            <div dangerouslySetInnerHTML={renderSafeMarkdown(msg.text)} />
+                            {msg.streaming && <span className="stream-cursor">▌</span>}
+                          </div>
+                        ) : msg.streaming ? (
+                          <div className="typing-dots"><span /><span /><span /></div>
+                        ) : null}
+                      </>
                     )}
 
                     {msg.payload && (
                       <>
-                        <div class="chat-meta-tag" title={`Intent: ${msg.payload.intent}`}>
-                          {msg.payload.llm_used ? <i class="fa-solid fa-microchip"></i> : <i class="fa-solid fa-network-wired"></i>} &bull; {msg.payload.intent} &bull; {Object.keys(msg.payload.filters_applied || {}).length} filters &bull; {(msg.payload.sources || []).length} sources
+                        <div className="chat-meta-tag" title={`Intent: ${msg.payload.intent}`}>
+                          <i className={`fa-solid ${msg.payload.llm_used ? 'fa-microchip' : 'fa-network-wired'}`} />
+                          {msg.payload.intent} • {Object.keys(msg.payload.filters_applied || {}).length} filters • {(msg.payload.sources || []).length} sources
                         </div>
-                        
-                        {msg.payload.listings && msg.payload.listings.length > 0 && (
-                          <button class="btn-api" onClick={handleFocusRAGListings} style={{ marginTop: '8px', width: '100%', justifyContent: 'center' }}>
-                            <i class="fa-solid fa-map-location-dot"></i> Ghim {msg.payload.listings.length} BĐS liên quan lên bản đồ
-                          </button>
+
+                        {msg.payload.listings?.length > 0 && (
+                          <div className="recommendations-panel">
+                            <div className="recommendations-heading">
+                              <span><i className="fa-solid fa-house-circle-check" /> BĐS được truy xuất</span>
+                              <button type="button" className="btn-soft" onClick={handleFocusRAGListings}>
+                                <i className="fa-solid fa-map-location-dot" /> Ghim {msg.payload.listings.length} tin
+                              </button>
+                            </div>
+                            {msg.payload.listings.slice(0, 4).map((item) => (
+                              <RecommendationCard
+                                key={item.id}
+                                item={item}
+                                onSelect={handleSelectListing}
+                                onCompare={toggleCompare}
+                                selectedForCompare={compareList.some((candidate) => candidate.id === item.id)}
+                              />
+                            ))}
+                          </div>
                         )}
 
-                        {msg.payload.sources && msg.payload.sources.length > 0 && (
+                        {msg.payload.sources?.length > 0 && (
                           <>
-                            <div class="sources-carousel-title" style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted-raw)', marginTop: '10px', textTransform: 'uppercase' }}>
-                              <i class="fa-solid fa-book-open"></i> Tài liệu tham khảo RAG
+                            <div className="sources-carousel-title">
+                              <i className="fa-solid fa-book-open" /> Tài liệu tham khảo RAG
                             </div>
-                            <div class="sources-carousel">
+                            <div className="sources-carousel">
                               {msg.payload.sources.map((source, sIdx) => {
-                                let badgeLabel = "Bài viết";
-                                if (source.collection === 'social_neighborhood') badgeLabel = "Ý kiến MXH";
-                                else if (source.collection === 'projects') badgeLabel = "Dự án";
-                                else if (source.collection === 'articles') badgeLabel = "Tin tức";
-
+                                const badgeLabel = source.collection === 'social_neighborhood'
+                                  ? 'Ý kiến MXH'
+                                  : source.collection === 'projects'
+                                    ? 'Dự án'
+                                    : source.collection === 'articles'
+                                      ? 'Tin tức'
+                                      : 'Bài viết';
                                 return (
-                                  <div key={sIdx} class="source-card animate-fade-in" onClick={() => source.url && source.url !== 'None' && window.open(source.url, '_blank')} title={`Độ khớp: ${(source.score * 100).toFixed(1)}%`}>
-                                    <span class="source-type-badge">{badgeLabel}</span>
+                                  <div key={`${source.collection}-${sIdx}`} className="source-card animate-fade-in" onClick={() => source.url && source.url !== 'None' && window.open(source.url, '_blank', 'noopener,noreferrer')} title={`Độ khớp: ${((source.score || 0) * 100).toFixed(1)}%`}>
+                                    <span className="source-type-badge">{badgeLabel}</span>
                                     <p>{source.text}</p>
                                   </div>
                                 );
@@ -608,105 +777,84 @@ export default function App() {
               ))}
             </div>
 
-            <form class="chat-input-form" onSubmit={handleChatSubmit}>
-              <div class="input-wrapper">
+            <form className="chat-input-form" onSubmit={handleChatSubmit}>
+              <div className="input-wrapper">
                 <textarea
                   id="chatInput"
                   rows={1}
                   value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  placeholder="Nhập câu hỏi tại đây... (Shift+Enter để xuống dòng)"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
+                  onChange={(event) => setChatInput(event.target.value)}
+                  placeholder="Nhập nhu cầu hoặc câu hỏi BĐS bằng tiếng Việt..."
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
                       handleChatSubmit();
                     }
                   }}
                 />
                 <button type="submit" disabled={isChatLoading} aria-label="Gửi câu hỏi">
-                  {isChatLoading ? <i class="fa-solid fa-circle-notch fa-spin"></i> : <i class="fa-solid fa-paper-plane"></i>}
+                  <i className={`fa-solid ${isChatLoading ? 'fa-circle-notch fa-spin' : 'fa-paper-plane'}`} />
                 </button>
               </div>
             </form>
           </section>
         )}
 
-        {/* TAB 2: ADVANCED SEARCH & FILTERS */}
         {activeTab === 'search' && (
-          <section id="searchTab" class="tab-content active" aria-label="Tìm kiếm nâng cao">
-            <header class="panel-header">
+          <section id="searchTab" className="tab-content active" aria-label="Tìm kiếm nâng cao">
+            <header className="panel-header">
               <div>
                 <h2>Tìm kiếm & Bộ lọc</h2>
-                <p id="evidenceSummary">Hiển thị {listings.length} bất động sản khớp</p>
+                <p>Hiển thị {listings.length} bất động sản khớp với bối cảnh hiện tại.</p>
               </div>
-              <button type="button" class="btn-icon" onClick={handleFitMap} title="Căn chỉnh bản đồ">
-                <i class="fa-solid fa-expand"></i>
+              <button type="button" className="btn-icon" onClick={handleFitMap} title="Căn chỉnh bản đồ">
+                <i className="fa-solid fa-expand" />
               </button>
             </header>
 
-            <div class="filter-controls-container">
-              <div class="filter-group">
-                <label for="searchInput">Từ khóa</label>
-                <div class="input-icon-wrapper">
-                  <i class="fa-solid fa-magnifying-glass"></i>
-                  <input 
-                    id="searchInput" 
-                    type="search" 
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Tên dự án, đường, quận..." 
-                  />
+            <div className="filter-controls-container">
+              <div className="filter-group">
+                <label htmlFor="searchInput">Từ khóa</label>
+                <div className="input-icon-wrapper">
+                  <i className="fa-solid fa-magnifying-glass" />
+                  <input id="searchInput" type="search" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Tên dự án, đường, quận..." />
                 </div>
               </div>
-
-              <div class="filter-row-grid">
-                <div class="filter-group">
-                  <label for="listingType">Giao dịch</label>
-                  <select id="listingType" value={listingType} onChange={(e) => setListingType(e.target.value)}>
+              <div className="filter-row-grid">
+                <div className="filter-group">
+                  <label htmlFor="listingType">Giao dịch</label>
+                  <select id="listingType" value={listingType} onChange={(event) => setListingType(event.target.value)}>
                     <option value="">Tất cả</option>
                     <option value="ban">Mua bán</option>
                     <option value="cho-thue">Cho thuê</option>
                   </select>
                 </div>
-                <div class="filter-group">
-                  <label for="provinceSelect">Tỉnh / Thành</label>
-                  <select id="provinceSelect" value={provinceSelect} onChange={(e) => setProvinceSelect(e.target.value)}>
+                <div className="filter-group">
+                  <label htmlFor="provinceSelect">Tỉnh / Thành</label>
+                  <select id="provinceSelect" value={provinceSelect} onChange={(event) => setProvinceSelect(event.target.value)}>
                     <option value="">Tất cả</option>
-                    {provinces.map(p => <option key={p} value={p}>{p}</option>)}
+                    {provinces.map((province) => <option key={province} value={province}>{province}</option>)}
                   </select>
                 </div>
               </div>
-
-              <div class="filter-group">
-                <div class="filter-label-row">
-                  <span>Khoảng giá</span>
-                  <span class="range-value-display">
-                    {minPrice || maxPrice ? `${minPrice || 0} - ${maxPrice || '∞'} Tỷ` : 'Tất cả'}
-                  </span>
-                </div>
-                <div class="range-inputs">
-                  <input type="number" placeholder="Min (Tỷ)" min="0" step="0.1" value={minPrice} onChange={(e) => setMinPrice(e.target.value)} />
-                  <input type="number" placeholder="Max (Tỷ)" min="0" step="0.1" value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} />
+              <div className="filter-group">
+                <div className="filter-label-row"><span>Khoảng giá</span><span className="range-value-display">{minPrice || maxPrice ? `${minPrice || 0} - ${maxPrice || '∞'} Tỷ` : 'Tất cả'}</span></div>
+                <div className="range-inputs">
+                  <input type="number" placeholder="Min (Tỷ)" min="0" step="0.1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} />
+                  <input type="number" placeholder="Max (Tỷ)" min="0" step="0.1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} />
                 </div>
               </div>
-
-              <div class="filter-group">
-                <div class="filter-label-row">
-                  <span>Diện tích (m²)</span>
-                  <span class="range-value-display">
-                    {minArea || maxArea ? `${minArea || 0} - ${maxArea || '∞'} m²` : 'Tất cả'}
-                  </span>
-                </div>
-                <div class="range-inputs">
-                  <input type="number" placeholder="Min" min="0" value={minArea} onChange={(e) => setMinArea(e.target.value)} />
-                  <input type="number" placeholder="Max" min="0" value={maxArea} onChange={(e) => setMaxArea(e.target.value)} />
+              <div className="filter-group">
+                <div className="filter-label-row"><span>Diện tích (m²)</span><span className="range-value-display">{minArea || maxArea ? `${minArea || 0} - ${maxArea || '∞'} m²` : 'Tất cả'}</span></div>
+                <div className="range-inputs">
+                  <input type="number" placeholder="Min" min="0" value={minArea} onChange={(event) => setMinArea(event.target.value)} />
+                  <input type="number" placeholder="Max" min="0" value={maxArea} onChange={(event) => setMaxArea(event.target.value)} />
                 </div>
               </div>
-
-              <div class="filter-row-grid">
-                <div class="filter-group">
-                  <label for="bedsSelect">Phòng ngủ</label>
-                  <select id="bedsSelect" value={bedsSelect} onChange={(e) => setBedsSelect(e.target.value)}>
+              <div className="filter-row-grid">
+                <div className="filter-group">
+                  <label htmlFor="bedsSelect">Phòng ngủ</label>
+                  <select id="bedsSelect" value={bedsSelect} onChange={(event) => setBedsSelect(event.target.value)}>
                     <option value="">Tất cả</option>
                     <option value="1">1 PN</option>
                     <option value="2">2 PN</option>
@@ -714,9 +862,9 @@ export default function App() {
                     <option value="4">4+ PN</option>
                   </select>
                 </div>
-                <div class="filter-group">
-                  <label for="sortBySelect">Sắp xếp</label>
-                  <select id="sortBySelect" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+                <div className="filter-group">
+                  <label htmlFor="sortBySelect">Sắp xếp</label>
+                  <select id="sortBySelect" value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
                     <option value="">Mặc định</option>
                     <option value="price_asc">Giá: Thấp đến Cao</option>
                     <option value="price_desc">Giá: Cao đến Thấp</option>
@@ -724,268 +872,175 @@ export default function App() {
                   </select>
                 </div>
               </div>
-
               {lastChatListings && (
-                <div class="rag-toggle-container">
-                  <label class="switch-label">
-                    <input type="checkbox" checked={ragFilterOnly} onChange={(e) => setRagFilterOnly(e.target.checked)} />
-                    <span class="slider-switch"></span>
+                <div className="rag-toggle-container">
+                  <label className="switch-label">
+                    <input type="checkbox" checked={ragFilterOnly} onChange={(event) => setRagFilterOnly(event.target.checked)} />
+                    <span className="slider-switch" />
                     <span>Chỉ hiện tin từ kết quả RAG gần nhất</span>
                   </label>
                 </div>
               )}
             </div>
 
-            <div class="stats-row" aria-label="Thống kê">
-              <div class="stat-card">
-                <span class="stat-val">{listings.length}</span>
-                <span class="stat-lbl">Tổng tin đăng</span>
-              </div>
-              <div class="stat-card">
-                <span class="stat-val text-sale">{listings.filter(i => i.listing_type === 'ban').length}</span>
-                <span class="stat-lbl">Tin bán</span>
-              </div>
-              <div class="stat-card">
-                <span class="stat-val text-rent">{listings.filter(i => i.listing_type === 'cho-thue').length}</span>
-                <span class="stat-lbl">Tin thuê</span>
-              </div>
+            <div className="stats-row" aria-label="Thống kê">
+              <div className="stat-card"><span className="stat-val">{listings.length}</span><span className="stat-lbl">Tổng tin</span></div>
+              <div className="stat-card"><span className="stat-val text-sale">{listings.filter((item) => item.listing_type === 'ban').length}</span><span className="stat-lbl">Tin bán</span></div>
+              <div className="stat-card"><span className="stat-val text-rent">{listings.filter((item) => item.listing_type === 'cho-thue').length}</span><span className="stat-lbl">Tin thuê</span></div>
             </div>
 
-            <div id="listingList" class="listing-list-scroll">
+            <div id="listingList" className="listing-list-scroll">
               {listings.length === 0 ? (
-                <div class="poi-empty">
-                  <i class="fa-solid fa-house-circle-xmark" style={{ fontSize: '24px', display: 'block', marginBottom: '8px' }}></i>
-                  Không có tin đăng nào khớp với bộ lọc của bạn.
+                <div className="poi-empty">
+                  <i className="fa-solid fa-house-circle-xmark" /> Không có tin đăng nào khớp với bộ lọc của bạn.
                 </div>
               ) : (
-                listings.map(item => (
-                  <article 
+                listings.map((item) => (
+                  <ListingCard
                     key={item.id}
-                    className={`listing-card ${item.id === activeId ? 'active' : ''}`}
-                    onClick={() => handleSelectListing(item.id)}
-                  >
-                    {item.image ? (
-                      <img src={item.image} alt={item.title} loading="lazy" />
-                    ) : (
-                      <div style={{ width: '90px', height: '80px', backgroundColor: 'var(--border-raw)', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted-raw)', flexShrink: 0 }}>
-                        <i class="fa-solid fa-image"></i>
-                      </div>
-                    )}
-                    <div class="listing-info">
-                      <h3>{item.title}</h3>
-                      <div class="listing-meta-tags">
-                        <span className={`badge-tag ${item.listing_type === 'ban' ? 'sale' : 'rent'}`}>
-                          {item.listing_type === 'ban' ? 'Bán' : 'Thuê'}
-                        </span>
-                        <span class="badge-tag price">{formatMoney(item.price_vnd)}</span>
-                        {item.area_m2 && <span class="badge-tag">{item.area_m2} m²</span>}
-                      </div>
-                      <p class="listing-address"><i class="fa-solid fa-location-dot"></i> {item.address}</p>
-                    </div>
-                  </article>
+                    item={item}
+                    active={item.id === activeId}
+                    onSelect={handleSelectListing}
+                    onCompare={toggleCompare}
+                    selectedForCompare={compareList.some((candidate) => candidate.id === item.id)}
+                  />
                 ))
               )}
             </div>
           </section>
         )}
 
-        {/* TAB 3: DETAILS & FINANCIAL CALCULATOR */}
         {activeTab === 'details' && (
-          <section id="detailsTab" class="tab-content active" aria-label="Chi tiết bất động sản">
+          <section id="detailsTab" className="tab-content active" aria-label="Chi tiết bất động sản">
             {!activeId || !activeListing ? (
-              <div class="details-placeholder animate-fade-in">
-                <i class="fa-solid fa-house-circle-exclamation"></i>
+              <div className="details-placeholder animate-fade-in">
+                <i className="fa-solid fa-house-circle-exclamation" />
                 <h3>Chưa chọn bất động sản</h3>
-                <p>Nhấp vào một tin đăng trong danh sách hoặc ghim trên bản đồ để xem chi tiết, tiện ích xung quanh và tính toán tài chính.</p>
+                <p>Chọn một tin đăng hoặc ghim trên bản đồ để xem quyết định chi tiết.</p>
               </div>
             ) : (
-              <div class="details-content-scroll">
-                <div>
-                  <div class="detail-image-wrapper">
-                    {activeListing.image ? (
-                      <img src={activeListing.image} alt={activeListing.title} />
-                    ) : (
-                      <div style={{ height: '180px', backgroundColor: 'var(--border-raw)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted-raw)' }}>
-                        <i class="fa-solid fa-image" style={{ fontSize: '32px' }}></i>
-                      </div>
-                    )}
-                  </div>
-                  
-                  <div style={{ marginTop: '14px' }}>
-                    <h3 class="detail-title">{activeListing.title}</h3>
-                    <p class="detail-location-text"><i class="fa-solid fa-location-dot"></i> {activeListing.address}</p>
-                    
-                    <div class="detail-params-row">
-                      <div class="param-badge">
-                        <span class="param-val">{formatMoney(activeListing.price_vnd)}</span>
-                        <span class="param-lbl">Giá cả</span>
-                      </div>
-                      <div class="param-badge">
-                        <span class="param-val">{activeListing.area_m2 ? `${activeListing.area_m2} m²` : 'N/A'}</span>
-                        <span class="param-lbl">Diện tích</span>
-                      </div>
-                      <div class="param-badge">
-                        <span class="param-val">{activeListing.bedrooms ? `${activeListing.bedrooms} PN` : 'N/A'}</span>
-                        <span class="param-lbl">Phòng ngủ</span>
-                      </div>
-                    </div>
-
-                    <div class="detail-description-section" style={{ marginTop: '16px' }}>
-                      <h4>Mô tả tin đăng</h4>
-                      <p class="detail-description-text">{activeListing.title} - Toạ lạc tại khu vực {activeListing.district}, {activeListing.province}. Bất động sản này sở hữu đầy đủ tiềm năng đầu tư, môi trường sống xanh và kết nối hạ tầng giao thông lý tưởng.</p>
-                    </div>
-
-                    <div class="detail-meta-table">
-                      <div class="meta-cell"><span class="meta-lbl">Pháp lý:</span> <span class="meta-val">{activeListing.legal || 'Đang cập nhật'}</span></div>
-                      <div class="meta-cell"><span class="meta-lbl">Nội thất:</span> <span class="meta-val">{activeListing.furniture || 'Đang cập nhật'}</span></div>
-                      <div class="meta-cell"><span class="meta-lbl">Giao dịch:</span> <span class="meta-val">{activeListing.listing_type === 'ban' ? 'Mua bán' : 'Cho thuê'}</span></div>
-                      <div class="meta-cell"><span class="meta-lbl">Phòng tắm:</span> <span class="meta-val">{activeListing.bathrooms || 'N/A'} WC</span></div>
-                    </div>
-                    
-                    {activeListing.url && (
-                      <a href={activeListing.url} target="_blank" rel="noreferrer" class="btn-api" style={{ marginTop: '14px', width: '100%', justifyContent: 'center' }}>
-                        <i class="fa-solid fa-arrow-up-right-from-square"></i> Xem liên kết tin gốc
-                      </a>
-                    )}
-                  </div>
+              <div className="details-content-scroll decision-dashboard">
+                <div className="detail-image-wrapper">
+                  {activeListing.image ? <img src={activeListing.image} alt={activeListing.title || 'Bất động sản'} /> : <div className="detail-image-placeholder"><i className="fa-solid fa-image" /></div>}
+                </div>
+                <div className="detail-heading-block">
+                  <span className={`badge-tag ${activeListing.listing_type === 'ban' ? 'sale' : 'rent'}`}>{listingModeLabel(activeListing)}</span>
+                  <h3 className="detail-title">{activeListing.title || 'Tin đăng chưa có tiêu đề'}</h3>
+                  <p className="detail-location-text"><i className="fa-solid fa-location-dot" /> {activeListing.address || 'Chưa có địa chỉ'}</p>
                 </div>
 
-                {/* Nearby POIs */}
-                <section class="amenities-section card-glass">
-                  <h3><i class="fa-solid fa-map-location-dot"></i> Tiện ích lân cận (Bán kính 2km)</h3>
-                  <div class="pois-grid">
-                    {isPoisLoading ? (
-                      <div class="poi-loading"><i class="fa-solid fa-circle-notch fa-spin"></i> Đang tải tiện ích...</div>
-                    ) : pois.length === 0 ? (
-                      <div class="poi-empty"><i class="fa-solid fa-house-circle-exclamation"></i> Không có tiện ích lân cận nào được lưu.</div>
-                    ) : (
-                      pois.map((poi, pIdx) => {
-                        let icon = '<i class="fa-solid fa-location-dot"></i>';
-                        if (poi.category === 'transit_station') icon = '<i class="fa-solid fa-train-subway"></i>';
-                        else if (poi.category === 'school') icon = '<i class="fa-solid fa-graduation-cap"></i>';
-                        else if (poi.category === 'hospital') icon = '<i class="fa-solid fa-house-medical"></i>';
-                        else if (poi.category === 'park') icon = '<i class="fa-solid fa-tree"></i>';
+                <div className="decision-summary-grid">
+                  <div><strong>{formatMoney(activeListing.price_vnd)}</strong><span>Giá niêm yết</span></div>
+                  <div><strong>{activeListing.area_m2 ? `${activeListing.area_m2} m²` : 'Thiếu'}</strong><span>Diện tích</span></div>
+                  <div><strong>{formatPricePerM2(activeListing)}</strong><span>Đơn giá</span></div>
+                  <div><strong>{geoPrecisionLabel(activeListing.geo_precision)}</strong><span>Độ tin cậy bản đồ</span></div>
+                </div>
 
-                        return (
-                          <div key={pIdx} className={`poi-item ${poi.category}`} title={poi.address}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                              <span style={{ color: 'var(--text-muted-raw)', fontSize: '13px' }} dangerouslySetInnerHTML={{ __html: icon }} />
-                              <span class="poi-name">{poi.name}</span>
-                            </div>
-                            <span class="poi-dist">{poi.distance_m}m</span>
-                          </div>
-                        );
-                      })
-                    )}
+                <div className="evidence-strip">
+                  <span><i className="fa-solid fa-file-shield" /> {activeListing.legal || 'Pháp lý đang cập nhật'}</span>
+                  <span><i className="fa-solid fa-couch" /> {activeListing.furniture || 'Nội thất đang cập nhật'}</span>
+                  <span><i className="fa-solid fa-bed" /> {activeListing.bedrooms ? `${activeListing.bedrooms} PN` : 'PN: N/A'}</span>
+                  <span><i className="fa-solid fa-bath" /> {activeListing.bathrooms ? `${activeListing.bathrooms} WC` : 'WC: N/A'}</span>
+                </div>
+
+                <section className="decision-section">
+                  <h4><i className="fa-solid fa-location-dot" /> Tiện ích xung quanh</h4>
+                  {isPoisLoading ? (
+                    <p className="muted-line">Đang tải POIs quanh bất động sản...</p>
+                  ) : pois.length ? (
+                    <div className="pois-grid">
+                      {pois.slice(0, 8).map((poi, index) => (
+                        <div key={`${poi.name}-${index}`} className={`poi-item ${poi.category || ''}`}>
+                          <span className="poi-name">{poi.name || 'POI chưa đặt tên'}</span>
+                          <small>{poiLabels[poi.category] || poi.category || 'Tiện ích'}</small>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted-line">Chưa có POIs liên kết trong cơ sở dữ liệu cho tin này.</p>
+                  )}
+                </section>
+
+                <section className="decision-section mortgage-panel">
+                  <h4><i className="fa-solid fa-calculator" /> Hoạch định tài chính</h4>
+                  <div className="mortgage-input-grid">
+                    <label>Trả trước (%)<input type="number" min="0" max="100" value={downPaymentPct} onChange={(event) => setDownPaymentPct(event.target.value)} /></label>
+                    <label>Lãi suất/năm (%)<input type="number" min="0" step="0.1" value={interestRate} onChange={(event) => setInterestRate(event.target.value)} /></label>
+                    <label>Thời hạn (năm)<input type="number" min="1" value={loanTermYears} onChange={(event) => setLoanTermYears(event.target.value)} /></label>
+                    <label>Thu nhập/tháng (triệu)<input type="number" min="0" value={monthlyIncome} onChange={(event) => setMonthlyIncome(event.target.value)} placeholder="VD: 60" /></label>
+                  </div>
+                  <div className={`affordability-card ${affordabilityLevel}`}>
+                    <strong>{formatMonthlyMoney(monthlyMortgagePayment)}</strong>
+                    <span>Ước tính trả góp hàng tháng</span>
+                    <small>Tổng lãi dự kiến: {formatMoney(totalInterestPayable > 0 ? totalInterestPayable : 0)}{incomeRatio !== null ? ` • Chiếm ${incomeRatio.toFixed(0)}% thu nhập` : ''}</small>
                   </div>
                 </section>
 
-                {/* Mortgage loan calculator */}
-                <section class="mortgage-section card-glass">
-                  <h3><i class="fa-solid fa-calculator"></i> Tính toán tài chính vay mua nhà</h3>
-                  <div class="calculator-form">
-                    <div class="calc-group">
-                      <div class="calc-label-row">
-                        <label>Tỷ lệ trả trước</label>
-                        <span>{downPaymentPct}%</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="10" 
-                        max="90" 
-                        step="5" 
-                        value={downPaymentPct} 
-                        onChange={(e) => setDownPaymentPct(parseInt(e.target.value))} 
-                      />
-                    </div>
-
-                    <div class="calc-row">
-                      <div class="calc-group">
-                        <label>Lãi suất (% / năm)</label>
-                        <input 
-                          type="number" 
-                          min="1" 
-                          max="25" 
-                          step="0.1" 
-                          value={interestRate} 
-                          onChange={(e) => setInterestRate(parseFloat(e.target.value) || 0)} 
-                        />
-                      </div>
-                      <div class="calc-group">
-                        <label>Kỳ hạn vay</label>
-                        <select value={loanTermYears} onChange={(e) => setLoanTermYears(parseInt(e.target.value))}>
-                          <option value="5">5 năm</option>
-                          <option value="10">10 năm</option>
-                          <option value="15">15 năm</option>
-                          <option value="20">20 năm</option>
-                          <option value="25">25 năm</option>
-                          <option value="30">30 năm</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div class="calc-group">
-                      <label>Thu nhập hàng tháng (Triệu VNĐ)</label>
-                      <input 
-                        type="number" 
-                        min="0" 
-                        value={monthlyIncome} 
-                        onChange={(e) => setMonthlyIncome(e.target.value)} 
-                        placeholder="Nhập thu nhập để đánh giá..." 
-                      />
-                    </div>
-
-                    <div class="calc-results-card">
-                      <div class="result-row">
-                        <span>Giá trị BĐS:</span>
-                        <strong>{formatMoney(listingPrice)}</strong>
-                      </div>
-                      <div class="result-row">
-                        <span>Số tiền trả trước:</span>
-                        <span>{formatMoney(listingPrice * (downPaymentPct / 100))}</span>
-                      </div>
-                      <div class="result-row">
-                        <span>Số tiền cần vay:</span>
-                        <strong class="text-accent">{formatMoney(loanPrincipal)}</strong>
-                      </div>
-                      <hr class="calc-divider" />
-                      <div class="result-row highlight">
-                        <span>Gốc + Lãi tháng đầu:</span>
-                        <strong>{listingPrice > 0 ? `${formatMoney(monthlyMortgagePayment)} / tháng` : '--'}</strong>
-                      </div>
-                      <div class="result-row">
-                        <span>Tổng tiền lãi phải trả:</span>
-                        <span>{listingPrice > 0 ? formatMoney(totalInterestPayable) : '--'}</span>
-                      </div>
-                      
-                      {affordabilityAlert && (
-                        <div 
-                          className={`affordability-alert ${affordabilityAlert.type} animate-fade-in`}
-                          dangerouslySetInnerHTML={{ __html: affordabilityAlert.html }}
-                        />
-                      )}
-                    </div>
-                  </div>
-                </section>
+                <div className="detail-action-row">
+                  {activeListing.url && (
+                    <a href={activeListing.url} target="_blank" rel="noreferrer" className="btn-api">
+                      <i className="fa-solid fa-arrow-up-right-from-square" /> Tin gốc
+                    </a>
+                  )}
+                  <button type="button" className="btn-soft" onClick={() => toggleCompare(activeListing)}>
+                    <i className="fa-solid fa-scale-balanced" /> {compareList.some((item) => item.id === activeListing.id) ? 'Bỏ so sánh' : 'Thêm so sánh'}
+                  </button>
+                </div>
               </div>
             )}
           </section>
         )}
+
+        {compareList.length > 0 && !showCompareModal && (
+          <div className="compare-floating-bar card-glass animate-slide-up">
+            <span>Đã chọn {compareList.length}/2 BĐS</span>
+            <div>
+              <button type="button" className="btn-api" disabled={compareList.length !== 2} onClick={() => setShowCompareModal(true)}>
+                So sánh
+              </button>
+              <button type="button" className="btn-soft" onClick={() => setCompareList([])} aria-label="Xóa danh sách so sánh">
+                <i className="fa-solid fa-times" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div
+          className={`sidebar-resizer ${isResizing ? 'is-resizing' : ''}`}
+          role="separator"
+          aria-label="Kéo để thay đổi chiều rộng khung chat"
+          aria-orientation="vertical"
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.currentTarget.setPointerCapture(event.pointerId);
+            setIsResizing(true);
+          }}
+          title="Kéo ngang để đổi chiều rộng khung chat"
+        >
+          <span className="sidebar-resizer-grip" />
+        </div>
       </aside>
 
-      {/* 3. Main Map Area */}
-      <main class="map-area">
-        <div class="map-overlay-toolbar card-glass animate-slide-down">
-          <div class="toolbar-left">
-            <span class="app-logo"><i class="fa-solid fa-compass-drafting"></i> Maps Portal</span>
-            <span id="mapTitle">Bản đồ phân phối ({listings.length} ghim)</span>
+      {showCompareModal && compareList.length === 2 && (
+        <CompareTable
+          items={compareList}
+          onClose={() => setShowCompareModal(false)}
+          onSubmitAnalysis={handleSubmitCompare}
+        />
+      )}
+
+      <main className="map-area">
+        <div className="map-overlay-toolbar card-glass animate-slide-down">
+          <div className="toolbar-left">
+            <span className="app-logo"><i className="fa-solid fa-map-location-dot" /> Bản đồ ngữ cảnh</span>
+            <span id="mapTitle">{listings.length} ghim theo nhu cầu</span>
           </div>
-          <div class="toolbar-right">
-            <span id="geoNote" class="geo-badge"><i class="fa-solid fa-location-crosshairs"></i> Vị trí ước lượng</span>
-            <a class="btn-api" href="/docs" target="_blank" rel="noreferrer" title="Swagger API Documentation"><i class="fa-solid fa-code"></i> API Docs</a>
+          <div className="toolbar-right">
+            <span id="geoNote" className="geo-badge"><i className="fa-solid fa-location-crosshairs" /> Có vị trí ước lượng</span>
+            <a className="btn-api" href="/docs" target="_blank" rel="noreferrer" title="Swagger API Documentation"><i className="fa-solid fa-code" /> API Docs</a>
           </div>
         </div>
-        <div id="map"></div>
+        <div id="map" />
       </main>
     </div>
   );

@@ -87,7 +87,7 @@ class PostgresClient:
                 ward VARCHAR(128),
                 address TEXT,
                 aliases TEXT[] DEFAULT '{}',
-                google_place_id TEXT,
+                osm_id TEXT,
                 latitude DOUBLE PRECISION,
                 longitude DOUBLE PRECISION,
                 source VARCHAR(64),
@@ -180,11 +180,11 @@ class PostgresClient:
                 crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """,
-            # 3. POI cache for Google Maps / Places and manually curated landmarks
+            # 3. POI cache for OpenStreetMap (Nominatim) and manually curated landmarks
             """
             CREATE TABLE IF NOT EXISTS pois (
                 id VARCHAR(64) PRIMARY KEY,
-                place_id TEXT UNIQUE,
+                osm_id TEXT UNIQUE,
                 name TEXT NOT NULL,
                 category VARCHAR(64) NOT NULL,
                 address TEXT,
@@ -197,19 +197,7 @@ class PostgresClient:
                 fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """,
-            # 4. Cached nearby measurements for property/project ranking
-            """
-            CREATE TABLE IF NOT EXISTS entity_poi_distances (
-                entity_type VARCHAR(32) NOT NULL,
-                entity_id VARCHAR(64) NOT NULL,
-                poi_id VARCHAR(64) NOT NULL,
-                distance_m DOUBLE PRECISION,
-                travel_time_s INTEGER,
-                travel_mode VARCHAR(32) DEFAULT 'straight_line',
-                computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (entity_type, entity_id, poi_id, travel_mode)
-            );
-            """,
+
             # 3. Articles Table
             """
             CREATE TABLE IF NOT EXISTS articles (
@@ -374,7 +362,6 @@ class PostgresClient:
     def reset_tables(self):
         """Drop and recreate all relational tables."""
         tables = [
-            "entity_poi_distances",
             "market_snapshots",
             "social_neighborhood",
             "pois",
@@ -977,86 +964,6 @@ class PostgresClient:
             log.warning(f"Error fetching from table {table_name}: {e}")
         return results
 
-    def fetch_nearby_pois(
-        self,
-        entity_ids: List[str],
-        entity_type: str = "listing",
-        categories: Optional[List[str]] = None,
-        top_n_per_category: int = 3,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Fetch pre-cached nearby POIs for a set of listing/project IDs.
-
-        This is a pure Postgres read from entity_poi_distances JOIN pois —
-        no external API calls are made at inference time.
-
-        Args:
-            entity_ids: List of listing/project IDs to enrich.
-            entity_type: 'listing' or 'project'.
-            categories: OSM categories to filter (e.g. ['school', 'transit_station']).
-                        If None, all categories are returned.
-            top_n_per_category: Max POIs per category per entity.
-
-        Returns:
-            Dict mapping entity_id -> list of POI dicts with keys:
-            name, category, distance_m, address.
-        """
-        if not entity_ids:
-            return {}
-
-        cat_filter = ""
-        params: Dict[str, Any] = {
-            "entity_type": entity_type,
-            "entity_ids": tuple(entity_ids),
-        }
-        if categories:
-            cat_filter = "AND p.category = ANY(%(categories)s)"
-            params["categories"] = categories
-
-        q = f"""
-            SELECT
-                epd.entity_id,
-                p.name,
-                p.category,
-                p.address,
-                epd.distance_m,
-                p.latitude,
-                p.longitude
-            FROM entity_poi_distances epd
-            JOIN pois p ON p.id = epd.poi_id
-            WHERE epd.entity_type = %(entity_type)s
-              AND epd.entity_id IN %(entity_ids)s
-              {cat_filter}
-            ORDER BY epd.entity_id, p.category, epd.distance_m
-        """
-
-        result: Dict[str, List[Dict[str, Any]]] = {eid: [] for eid in entity_ids}
-        # Track per-(entity_id, category) counts for top_n_per_category
-        category_counts: Dict[tuple, int] = {}
-
-        try:
-            with self.get_cursor() as cur:
-                cur.execute(q, params)
-                rows = cur.fetchall()
-                for entity_id, name, category, address, distance_m, lat, lng in rows:
-                    key = (entity_id, category)
-                    count = category_counts.get(key, 0)
-                    if count >= top_n_per_category:
-                        continue
-                    category_counts[key] = count + 1
-                    result[entity_id].append({
-                        "name": name,
-                        "category": category,
-                        "address": address or "",
-                        "distance_m": int(distance_m) if distance_m else None,
-                        "lat": lat,
-                        "lng": lng,
-                    })
-        except Exception as e:
-            log.warning(f"fetch_nearby_pois failed: {e}")
-
-        return result
-
     def fetch_market_stats(
         self,
         province: Optional[str] = None,
@@ -1089,7 +996,7 @@ class PostgresClient:
             listing_count, median_price_vnd, avg_price_vnd,
             median_price_per_m2_vnd, avg_area_m2, min_price_vnd, max_price_vnd
         """
-        conditions = ["period >= (date_trunc('month', CURRENT_DATE) - INTERVAL '%(months)s months')"]
+        conditions = ["period >= (date_trunc('month', CURRENT_DATE) - %(months)s::interval)"]
         params: Dict[str, Any] = {"months": f"{months} months"}
 
         if province:
@@ -1137,15 +1044,19 @@ class PostgresClient:
             log.warning(f"fetch_market_stats failed: {e}")
         return rows
 
-    def refresh_market_snapshots(self, period: Optional[date] = None):
+    def refresh_market_snapshots(self):
         """
         Rebuild market report aggregates from normalized listing facts.
-
-        This gives the assistant deterministic numbers for report generation
-        instead of asking the LLM to infer statistics from retrieved snippets.
+        Groups by the actual posted_at date (truncated to month) to build historical trends.
         """
-        snapshot_period = period or date.today().replace(day=1)
         q = """
+            WITH source_data AS (
+                SELECT
+                    date_trunc('month', coalesce(posted_at, crawled_at))::date AS period,
+                    province, district, ward, loai_nha_dat, loai_hinh, price_vnd, price_per_m2_vnd, dien_tich_m2
+                FROM listings
+                WHERE price_vnd IS NOT NULL
+            )
             INSERT INTO market_snapshots (
                 id, period, province, district, ward, property_type, listing_type,
                 listing_count, median_price_vnd, avg_price_vnd, median_price_per_m2_vnd,
@@ -1153,14 +1064,14 @@ class PostgresClient:
             )
             SELECT
                 md5(
-                    %(period)s::text || '|' ||
+                    to_char(period, 'YYYY-MM-DD') || '|' ||
                     coalesce(province, '') || '|' ||
                     coalesce(district, '') || '|' ||
                     coalesce(ward, '') || '|' ||
                     coalesce(loai_nha_dat, '') || '|' ||
                     coalesce(loai_hinh, '')
                 ) AS id,
-                %(period)s::date AS period,
+                period,
                 province,
                 district,
                 ward,
@@ -1173,9 +1084,8 @@ class PostgresClient:
                 avg(dien_tich_m2) AS avg_area_m2,
                 min(price_vnd)::bigint AS min_price_vnd,
                 max(price_vnd)::bigint AS max_price_vnd
-            FROM listings
-            WHERE price_vnd IS NOT NULL
-            GROUP BY province, district, ward, loai_nha_dat, loai_hinh
+            FROM source_data
+            GROUP BY period, province, district, ward, loai_nha_dat, loai_hinh
             ON CONFLICT (id) DO UPDATE SET
                 listing_count = EXCLUDED.listing_count,
                 median_price_vnd = EXCLUDED.median_price_vnd,
@@ -1187,7 +1097,111 @@ class PostgresClient:
                 generated_at = CURRENT_TIMESTAMP;
         """
         with self.get_cursor() as cur:
-            cur.execute(q, {"period": snapshot_period})
+            cur.execute(q)
+
+    def resolve_poi_osm(self, query: str) -> Optional[Dict[str, Any]]:
+        """Resolve POI name to coordinates using OpenStreetMap Nominatim API."""
+        import urllib.request
+        import urllib.parse
+        import uuid
+        
+        # 1. Search in local POIs table first
+        try:
+            with self.get_cursor() as cur:
+                cur.execute("SELECT id, name, latitude, longitude, address FROM pois WHERE name ILIKE %s OR address ILIKE %s LIMIT 1", (f"%{query}%", f"%{query}%"))
+                row = cur.fetchone()
+                if row:
+                    return {"id": row[0], "name": row[1], "lat": row[2], "lng": row[3], "address": row[4]}
+        except Exception as e:
+            log.warning(f"Error checking local pois: {e}")
+
+        # 2. Fetch from OSM Nominatim
+        try:
+            url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(query)}&format=json&limit=1"
+            req = urllib.request.Request(url, headers={'User-Agent': 'real-estate-assistant/1.0'})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+                if not data:
+                    return None
+                item = data[0]
+                lat = float(item['lat'])
+                lng = float(item['lon'])
+                name = item.get('display_name', query)
+                osm_id = str(item.get('osm_id', ''))
+                
+                # Insert into local pois
+                poi_id = f"osm_{uuid.uuid4().hex[:8]}"
+                with self.get_cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO pois (id, osm_id, name, category, address, latitude, longitude, source, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (osm_id) DO NOTHING
+                        """,
+                        (poi_id, osm_id, name, 'landmark', name, lat, lng, 'osm', json.dumps(item))
+                    )
+                return {"id": poi_id, "name": name, "lat": lat, "lng": lng, "address": name}
+        except Exception as e:
+            log.warning(f"Error fetching from OSM Nominatim: {e}")
+            return None
+
+    def search_nearby_real_estate(
+        self, lat: float, lng: float, radius_km: float = 2.0, filters: Optional[Dict[str, Any]] = None, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search listings nearby a given location using PostGIS ST_DWithin."""
+        radius_m = radius_km * 1000.0
+        
+        # Build filter conditions
+        where_clauses = ["geom IS NOT NULL", "ST_DWithin(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s)"]
+        params = [lng, lat, radius_m]
+        
+        if filters:
+            if filters.get("loai_nha_dat"):
+                where_clauses.append("loai_nha_dat ILIKE %s")
+                params.append(f"%{filters['loai_nha_dat']}%")
+            if filters.get("gia_tu_vnd") is not None:
+                where_clauses.append("price_vnd >= %s")
+                params.append(filters["gia_tu_vnd"])
+            if filters.get("gia_den_vnd") is not None:
+                where_clauses.append("price_vnd <= %s")
+                params.append(filters["gia_den_vnd"])
+            if filters.get("dien_tich_tu_m2") is not None:
+                where_clauses.append("dien_tich_m2 >= %s")
+                params.append(filters["dien_tich_tu_m2"])
+            if filters.get("dien_tich_den_m2") is not None:
+                where_clauses.append("dien_tich_m2 <= %s")
+                params.append(filters["dien_tich_den_m2"])
+                
+        q = f"""
+            SELECT 
+                raw_json,
+                ST_Distance(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) AS distance_m,
+                url
+            FROM listings
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY distance_m ASC
+            LIMIT %s
+        """
+        final_params = [lng, lat] + params + [limit]
+        
+        results = []
+        try:
+            with self.get_cursor() as cur:
+                cur.execute(q, tuple(final_params))
+                rows = cur.fetchall()
+                for r in rows:
+                    payload = r[0]
+                    distance_m = r[1]
+                    url = r[2]
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    payload["distance_m"] = distance_m
+                    if "url" not in payload:
+                        payload["url"] = url
+                    results.append(payload)
+        except Exception as e:
+            log.warning(f"Error in search_nearby_real_estate: {e}")
+        return results
 
     def close(self):
         """Close connection cleanly."""

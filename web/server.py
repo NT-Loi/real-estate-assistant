@@ -517,6 +517,11 @@ def chat(payload: ChatRequest):
                     }
                     yield f"event: metadata\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
 
+                elif etype in ["thought", "observation"]:
+                    text = event.get("text", "")
+                    if text:
+                        yield f"event: {etype}\ndata: {json.dumps(text, ensure_ascii=False)}\n\n"
+
                 elif etype == "chunk":
                     text = event.get("text", "")
                     if text:

@@ -2,10 +2,13 @@
 LLM Client — Google Gemini API wrapper using the google-genai SDK.
 
 Configuration (via .env or environment variables):
-  GEMINI_API_KEY   — required. Get yours at https://aistudio.google.com/apikey
-  GEMINI_MODEL     — optional. Default: gemini-2.0-flash
+  LLM_PROVIDER     — "vertexai", "gemini", or "ollama".
+  PROJECT_ID       — GCP project ID (required when LLM_PROVIDER=vertexai).
+  VERTEX_LOCATION  — Vertex AI location (optional, default: "global").
+  GEMINI_API_KEY   — required when LLM_PROVIDER=gemini.
+  GEMINI_MODEL     — optional. Default: gemini-2.5-flash-lite.
 
-Falls back to a formatted text response if GEMINI_API_KEY is not set.
+Falls back to a formatted text response if no LLM provider is available.
 """
 from __future__ import annotations
 
@@ -40,17 +43,22 @@ class LLMClient:
     ):
         self._provider = provider or os.environ.get("LLM_PROVIDER", "").lower()
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
-        self._model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
-        
+        self._model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+        self._project_id = os.environ.get("PROJECT_ID", "")
+        self._vertex_location = os.environ.get("VERTEX_LOCATION", "global")
+
         self._ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-        self._ollama_model = os.environ.get("OLLAMA_MODEL", "smallthinker")
-        
+        self._ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+
         self._client = None
         self._available = False
 
         # Default provider resolution
         if not self._provider:
-            if self._api_key and self._api_key != "your_gemini_api_key_here":
+            if self._project_id:
+                self._provider = "vertexai"
+            elif self._api_key and self._api_key != "your_gemini_api_key_here":
                 self._provider = "gemini"
             else:
                 self._provider = "ollama"
@@ -58,7 +66,6 @@ class LLMClient:
         if self._provider == "ollama":
             import requests
             try:
-                # Quick health check ping to Ollama base endpoint
                 resp = requests.get(self._ollama_base_url, timeout=2.0)
                 if resp.status_code == 200:
                     self._available = True
@@ -67,7 +74,29 @@ class LLMClient:
                     log.warning(f"Ollama server returned status {resp.status_code} at {self._ollama_base_url}")
             except Exception as e:
                 log.warning(f"Failed to connect to Ollama server at {self._ollama_base_url}: {e}")
-        else:
+
+        elif self._provider == "vertexai":
+            if not self._project_id:
+                log.warning("LLM_PROVIDER=vertexai but PROJECT_ID is not set. Disabling LLM.")
+            else:
+                try:
+                    from google import genai
+                    self._client = genai.Client(
+                        vertexai=True,
+                        project=self._project_id,
+                        location=self._vertex_location,
+                    )
+                    self._available = True
+                    log.info(
+                        f"Vertex AI LLM initialized (Model: {self._model_name}, "
+                        f"Project: {self._project_id}, Location: {self._vertex_location})"
+                    )
+                except ImportError:
+                    log.warning("google-genai not installed. Run: pip install google-genai")
+                except Exception as e:
+                    log.warning(f"Failed to initialize Vertex AI client: {e}")
+
+        else:  # gemini (API key)
             self._provider = "gemini"
             if self._api_key and self._api_key != "your_gemini_api_key_here":
                 try:
@@ -78,7 +107,7 @@ class LLMClient:
                 except ImportError:
                     log.warning(
                         "google-genai not installed. "
-                        "Run: uv pip install google-genai"
+                        "Run: pip install google-genai"
                     )
                 except Exception as e:
                     log.warning(f"Failed to initialize Gemini: {e}")
@@ -168,7 +197,7 @@ class LLMClient:
 
             # Try primary model, then fallback models on rate-limit
             models_to_try = [self._model_name]
-            if self._model_name not in ("gemini-2.0-flash", "gemini-1.5-flash"):
+            if self._model_name not in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
                 models_to_try.append("gemini-2.0-flash")
 
             last_error = None
@@ -180,8 +209,10 @@ class LLMClient:
                             contents=prompt,
                             config=config,
                         )
-                        if response and response.text:
-                            return response.text.strip()
+                        # For Gemini 2.5 thinking models, extract only non-thought parts
+                        text = LLMClient._extract_non_thought_text(response)
+                        if text:
+                            return text.strip()
                         return "(Không thể tạo câu trả lời. Vui lòng thử lại.)"
 
                     except Exception as e:
@@ -289,7 +320,7 @@ class LLMClient:
                 return
 
         else:
-            # Gemini streaming
+            # Gemini / Vertex AI streaming — filter out thought tokens from thinking models
             try:
                 from google import genai
                 from google.genai import types
@@ -303,7 +334,7 @@ class LLMClient:
             )
 
             models_to_try = [self._model_name]
-            if self._model_name not in ("gemini-2.0-flash", "gemini-1.5-flash"):
+            if self._model_name not in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
                 models_to_try.append("gemini-2.0-flash")
 
             for model in models_to_try:
@@ -314,8 +345,18 @@ class LLMClient:
                         config=config,
                     )
                     for chunk in stream:
-                        if chunk.text:
-                            yield chunk.text
+                        # Iterate parts directly to skip thought tokens
+                        try:
+                            parts = chunk.candidates[0].content.parts
+                            for part in parts:
+                                if getattr(part, "thought", False):
+                                    continue  # skip thinking tokens
+                                if part.text:
+                                    yield part.text
+                        except (IndexError, AttributeError):
+                            # Fallback if structure differs
+                            if chunk.text:
+                                yield chunk.text
                     return  # Success — stop trying other models
                 except Exception as e:
                     err_str = str(e)
@@ -324,6 +365,27 @@ class LLMClient:
                         continue
                     log.error(f"Gemini streaming error [{model}]: {e}")
                     return
+
+    @staticmethod
+    def _extract_non_thought_text(response) -> str:
+        """
+        Extract only non-thought text from a Gemini response.
+
+        Gemini 2.5 thinking models return thought tokens in parts with
+        `part.thought == True`. This helper skips those parts and returns
+        only the final answer text.
+        """
+        try:
+            parts = response.candidates[0].content.parts
+            texts = [
+                part.text
+                for part in parts
+                if not getattr(part, "thought", False) and part.text
+            ]
+            return "".join(texts)
+        except (IndexError, AttributeError):
+            # Fallback: use response.text which may include thought tokens
+            return response.text or ""
 
     @staticmethod
     def format_without_llm(

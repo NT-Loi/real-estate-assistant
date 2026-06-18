@@ -262,10 +262,30 @@ class RAGChain:
                 clauses.append("loai_nha_dat ILIKE %s")
                 params.append(f"%{prop_type}%")
                 
+            lat = kwargs.get("lat")
+            lon = kwargs.get("lon")
+            order_by = ""
+            if lat is not None and lon is not None:
+                lat = float(lat)
+                lon = float(lon)
+                radius_km = float(kwargs.get("radius_km", 2.0))
+                # Haversine distance formula in km
+                haversine_expr = """
+                    (6371 * acos(least(1.0, 
+                        cos(radians(%s)) * cos(radians(latitude)) * 
+                        cos(radians(longitude) - radians(%s)) + 
+                        sin(radians(%s)) * sin(radians(latitude))
+                    )))
+                """
+                clauses.append(f"{haversine_expr} <= %s")
+                params.extend([lat, lon, lat, radius_km])
+                order_by = f"ORDER BY {haversine_expr} ASC"
+                params.extend([lat, lon, lat])
+                
             limit = int(kwargs.get("limit", 5))
             
             where_sql = " AND ".join(clauses)
-            sql = f"SELECT raw_json FROM listings WHERE {where_sql} LIMIT %s"
+            sql = f"SELECT raw_json FROM listings WHERE {where_sql} {order_by} LIMIT %s"
             params.append(limit)
             
             results = []
@@ -305,36 +325,64 @@ class RAGChain:
         except Exception as e:
             return f"Lỗi khi lọc bất động sản: {e}"
 
-    def _tool_calculate_loan(self, **kwargs) -> str:
-        """Run finance loan calculations."""
+    def _tool_analyze_market_trend(self, **kwargs) -> str:
+        """Analyze historical market trends and compare property price."""
         try:
-            log.info(f"Tool called: calculate_loan({kwargs=})")
-            price_trieu = float(kwargs.get("property_price_trieu", 0))
-            if price_trieu <= 0:
-                return "Lỗi: Giá trị bất động sản phải lớn hơn 0."
-                
-            down_pct = float(kwargs.get("down_payment_pct", 0.3))
-            annual_rate = float(kwargs.get("annual_rate_pct", 9.0))
-            term_years = int(kwargs.get("term_years", 20))
+            log.info(f"Tool called: analyze_market_trend({kwargs=})")
+            tinh_thanh = kwargs.get("tinh_thanh")
+            quan_huyen = kwargs.get("quan_huyen")
+            property_type = kwargs.get("property_type")
+            target_price_vnd = kwargs.get("target_price_vnd")
+            target_area_m2 = kwargs.get("target_area_m2")
             
-            plan = FinanceCalculator.loan_from_property_price(
-                property_price_vnd=price_trieu * 1_000_000,
-                down_payment_pct=down_pct,
-                annual_rate_pct=annual_rate,
-                term_years=term_years
+            if not tinh_thanh or not quan_huyen:
+                return "Vui lòng cung cấp cả Tỉnh/Thành phố và Quận/Huyện để phân tích thị trường."
+            
+            # Fetch past 12 months data
+            rows = self._store.pg.fetch_market_stats(
+                province=tinh_thanh,
+                district=quan_huyen,
+                property_type=property_type,
+                months=12
             )
-            summary = plan.summary_text()
             
-            scenarios = FinanceCalculator.multi_scenario(plan.principal_vnd)
-            scenarios_str = "\n--- So sánh theo lãi suất ---"
-            for s in scenarios:
-                def fmt(v):
-                    return f"{v/1_000_000:.0f} triệu" if v < 1_000_000_000 else f"{v/1_000_000_000:.2f} tỷ"
-                scenarios_str += f"\n  {s.annual_rate_pct:.1f}%/năm -> {fmt(s.monthly_payment_vnd)}/tháng"
+            if not rows:
+                return f"Không tìm thấy dữ liệu thống kê thị trường lịch sử cho khu vực {quan_huyen}, {tinh_thanh}."
                 
-            return summary + "\n" + scenarios_str
+            # Formatting the result
+            output = [f"BÁO CÁO PHÂN TÍCH XU HƯỚNG THỊ TRƯỜNG: {quan_huyen}, {tinh_thanh}\n"]
+            
+            # Target property analysis
+            if target_price_vnd and target_area_m2 and target_area_m2 > 0:
+                target_price_per_m2 = float(target_price_vnd) / float(target_area_m2)
+                # Find the latest median price from rows
+                latest_row = rows[0]
+                latest_median_per_m2 = float(latest_row.get("median_price_per_m2_vnd") or 0)
+                
+                output.append("1. ĐỐI CHIẾU GIÁ BĐS CỤ THỂ:")
+                output.append(f"- Giá BĐS đang xét: {target_price_vnd/1e9:.2f} tỷ ({target_price_per_m2/1e6:.1f} triệu/m2)")
+                if latest_median_per_m2 > 0:
+                    output.append(f"- Mặt bằng giá chung hiện tại: {latest_median_per_m2/1e6:.1f} triệu/m2")
+                    diff_pct = ((target_price_per_m2 - latest_median_per_m2) / latest_median_per_m2) * 100
+                    if diff_pct > 0:
+                        output.append(f"-> ĐÁNH GIÁ: Giá BĐS này cao hơn mặt bằng chung {diff_pct:.1f}%.")
+                    else:
+                        output.append(f"-> ĐÁNH GIÁ: Giá BĐS này rẻ hơn mặt bằng chung {abs(diff_pct):.1f}%.")
+                else:
+                    output.append("-> Không có đủ dữ liệu mặt bằng giá chung để đối chiếu.")
+                output.append("")
+                
+            output.append("2. LỊCH SỬ BIẾN ĐỘNG GIÁ (12 THÁNG GẦN NHẤT):")
+            for r in rows:
+                period = r.get('period', '')
+                median_m2 = float(r.get('median_price_per_m2_vnd') or 0)
+                count = r.get('listing_count', 0)
+                if median_m2 > 0:
+                    output.append(f"- Tháng {period}: {median_m2/1e6:.1f} triệu/m2 ({count} tin đăng)")
+            
+            return "\n".join(output)
         except Exception as e:
-            return f"Lỗi khi tính toán khoản vay: {e}"
+            return f"Lỗi khi phân tích xu hướng giá: {e}"
 
     def _tool_get_market_statistics(self, **kwargs) -> str:
         """Get PostgreSQL-based aggregated statistics snapshots."""
@@ -357,6 +405,104 @@ class RAGChain:
             return format_context(docs)
         except Exception as e:
             return f"Lỗi khi truy vấn thống kê thị trường: {e}"
+
+
+
+    def _tool_web_search(self, query: str, limit: int = 3) -> str:
+        """Search the web using Tavily."""
+        try:
+            log.info(f"Tool called: web_search({query=}, {limit=})")
+            import os
+            import requests
+            
+            api_key = os.getenv("TAVILY_API") or os.getenv("TAVILY_API_KEY")
+            if not api_key:
+                return "Lỗi: Không tìm thấy TAVILY_API trong file .env"
+                
+            payload = {
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "include_answer": False,
+                "max_results": limit
+            }
+            
+            r = requests.post("https://api.tavily.com/search", json=payload, timeout=15)
+            if r.status_code != 200:
+                return f"Lỗi từ Tavily API: {r.text}"
+                
+            data = r.json()
+            results = data.get("results", [])
+            
+            if not results:
+                return f"Không tìm thấy kết quả nào trên web cho: {query}"
+            
+            output = []
+            for i, res in enumerate(results):
+                output.append(f"Kết quả {i+1}:\nTiêu đề: {res.get('title')}\nURL: {res.get('url')}\nTrích đoạn: {res.get('content')}\n")
+            
+            from rag.retriever import RetrievedDocument
+            doc = RetrievedDocument(
+                text="\n".join(output),
+                metadata={"url": "Tavily Search"},
+                score=1.0,
+                collection="web_search",
+                record=None
+            )
+            self._agent_sources.append(doc)
+            return "\n".join(output)
+        except Exception as e:
+            return f"Lỗi khi tìm kiếm web: {e}"
+
+    def _tool_search_location(self, location_name: str) -> str:
+        """Search for a location using OpenStreetMap Nominatim API."""
+        try:
+            log.info(f"Tool called: search_location({location_name=})")
+            import requests
+            headers = {"User-Agent": "RealEstateAssistant/1.0"}
+            r = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": location_name, "format": "json", "limit": 1},
+                headers=headers,
+                timeout=10
+            )
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                return f"Không tìm thấy tọa độ cho địa danh: {location_name}"
+            
+            lat = float(data[0]["lat"])
+            lon = float(data[0]["lon"])
+            display_name = data[0].get("display_name", "")
+            return f'{{"lat": {lat}, "lon": {lon}, "display_name": "{display_name}"}}'
+        except Exception as e:
+            return f"Lỗi khi tìm kiếm vị trí bản đồ: {e}"
+
+    def _tool_read_url(self, url: str) -> str:
+        """Read full content of a URL using Jina Reader API."""
+        try:
+            log.info(f"Tool called: read_url({url=})")
+            import requests
+            r = requests.get(f"https://r.jina.ai/{url}", timeout=15)
+            r.raise_for_status()
+            content = r.text
+            
+            max_len = 6000
+            if len(content) > max_len:
+                content = content[:max_len] + "\n...[Nội dung bị cắt bớt vì quá dài]..."
+                
+            from rag.retriever import RetrievedDocument
+            doc = RetrievedDocument(
+                text=content,
+                metadata={"url": url},
+                score=1.0,
+                collection="web_search",
+                record=None
+            )
+            self._agent_sources.append(doc)
+            return content
+        except Exception as e:
+            return f"Lỗi khi đọc nội dung URL: {e}"
 
     def _execute_tool(self, tool_name: str, args_str: str) -> str:
         """Parse arguments and route execution to the corresponding tool."""
@@ -384,10 +530,16 @@ class RAGChain:
             )
         elif tool_name == "filter_listings":
             return self._tool_filter_listings(**args)
-        elif tool_name == "calculate_loan":
-            return self._tool_calculate_loan(**args)
+        elif tool_name == "analyze_market_trend":
+            return self._tool_analyze_market_trend(**args)
         elif tool_name == "get_market_statistics":
             return self._tool_get_market_statistics(**args)
+        elif tool_name == "web_search":
+            return self._tool_web_search(**args)
+        elif tool_name == "read_url":
+            return self._tool_read_url(**args)
+        elif tool_name == "search_location":
+            return self._tool_search_location(**args)
         else:
             return f"Lỗi: Không tìm thấy công cụ tên là '{tool_name}'."
 
@@ -438,7 +590,7 @@ class RAGChain:
                     break
 
                 # Parse Action
-                action_match = re.search(r"Action:\s*(\w+)", response, re.IGNORECASE)
+                action_match = re.search(r"Action:\s*`?(\w+)`?", response, re.IGNORECASE)
                 if action_match:
                     tool_name = action_match.group(1).strip()
                     remaining = response[action_match.end():].strip()
@@ -450,6 +602,11 @@ class RAGChain:
                         log.info(f"Executing tool {tool_name} with arguments: {tool_args_str}")
                         observation = self._execute_tool(tool_name, tool_args_str)
                         log.info(f"Observation: {observation}")
+                        agent_prompt += f"\n{response}\nObservation: {observation}\n"
+                        continue
+                    else:
+                        observation = "Lỗi: Tham số không đúng định dạng JSON. Vui lòng định dạng dưới dạng: Action: tool_name({\"key\": \"value\"})"
+                        log.warning(f"Malformed tool call JSON. LLM output: {response}")
                         agent_prompt += f"\n{response}\nObservation: {observation}\n"
                         continue
 
@@ -495,13 +652,12 @@ class RAGChain:
         user_query: str,
         top_k: int = 5,
     ) -> Iterator[dict]:
-        """Process a user query and stream thoughts + tool calls + final answers."""
+        """Process a user query: run ReAct loop silently, then stream the final answer."""
         log.info(f"Streaming query: {user_query[:80]}...")
-        
+
         self._agent_sources = []
         parsed = self._parser.parse(user_query)
 
-        # Setup ReAct system instructions
         from rag.prompts import REACT_SYSTEM_PROMPT, SYSTEM_PROMPT
         agent_prompt = (
             f"{REACT_SYSTEM_PROMPT}\n\n"
@@ -512,6 +668,10 @@ class RAGChain:
         MAX_ITERATIONS = 5
 
         if self._llm.is_available:
+            # ── Phase 1: Run the full ReAct loop silently ──────────────────────
+            # The user only sees brief tool-call status events during this phase.
+            raw_final = ""
+
             for iteration in range(MAX_ITERATIONS):
                 response = self._llm.generate(
                     prompt=agent_prompt,
@@ -520,73 +680,93 @@ class RAGChain:
                 )
                 if not response:
                     break
-
-                # Stream intermediate thought to the UI
-                thought_match = re.search(r"Thought:(.*?)(?:Action:|$)", response, re.DOTALL | re.IGNORECASE)
-                thought_text = thought_match.group(1).strip() if thought_match else ""
-                if thought_text:
-                    yield {"type": "chunk", "text": f"\n*[Suy nghĩ: {thought_text}]*\n"}
+                    
+                log.info(f"LLM Response in Stream:\n{response}")
+                yield {"type": "thought", "text": response}
 
                 if "Final Answer:" in response:
-                    parts = response.split("Final Answer:", 1)
-                    final_answer = parts[1].strip()
-                    
-                    # Yield metadata before streaming the final answer
-                    serialized_sources = []
-                    for doc in self._agent_sources:
-                        meta = getattr(doc, "metadata", {}) or {}
-                        serialized_sources.append({
-                            "collection": getattr(doc, "collection", ""),
-                            "score": getattr(doc, "score", 0),
-                            "text": (getattr(doc, "text", "") or "")[:1200],
-                            "metadata": meta,
-                            "url": meta.get("url", ""),
-                        })
+                    raw_final = response.split("Final Answer:", 1)[1].strip()
+                    break
 
-                    yield {
-                        "type": "metadata",
-                        "intent": parsed.intent,
-                        "filters": parsed.filters,
-                        "sources": serialized_sources,
-                    }
-
-                    yield {"type": "chunk", "text": f"\n\n{final_answer}"}
-                    yield {"type": "done"}
-                    return
-
-                # Parse Action
-                action_match = re.search(r"Action:\s*(\w+)", response, re.IGNORECASE)
+                # Execute tool call
+                action_match = re.search(r"Action:\s*`?(\w+)`?", response, re.IGNORECASE)
                 if action_match:
                     tool_name = action_match.group(1).strip()
                     remaining = response[action_match.end():].strip()
                     brace_start = remaining.find("{")
                     brace_end = remaining.rfind("}")
-                    
+
                     if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
                         tool_args_str = remaining[brace_start:brace_end+1]
-                        
-                        yield {"type": "chunk", "text": f"\n*🔧 Thực hiện công cụ: `{tool_name}({tool_args_str})`*\n"}
-                        
+
+                        # Brief status — user knows the agent is working
+                        yield {"type": "status", "text": f"🔧 Đang tra cứu: {tool_name}..."}
+
                         observation = self._execute_tool(tool_name, tool_args_str)
+                        yield {"type": "observation", "text": f"Observation: {observation}"}
+                        agent_prompt += f"\n{response}\nObservation: {observation}\n"
+                        continue
+                    else:
+                        observation = "Lỗi: Tham số không đúng định dạng JSON. Vui lòng định dạng dưới dạng: Action: tool_name({\"key\": \"value\"})"
+                        log.warning(f"Malformed tool call JSON. LLM output: {response}")
+                        yield {"type": "observation", "text": f"Observation: {observation}"}
                         agent_prompt += f"\n{response}\nObservation: {observation}\n"
                         continue
 
-                # Fallback
-                clean_response = response.replace("Thought:", "").strip()
-                
-                serialized_sources = []
-                yield {
-                    "type": "metadata",
-                    "intent": parsed.intent,
-                    "filters": parsed.filters,
-                    "sources": serialized_sources,
-                }
-                yield {"type": "chunk", "text": f"\n\n{clean_response}"}
-                yield {"type": "done"}
-                return
-            else:
-                yield {"type": "chunk", "text": "\nTôi đã vượt quá giới hạn suy nghĩ nhưng chưa đưa được câu trả lời hoàn chỉnh."}
-                yield {"type": "done"}
+                # No Action and no Final Answer — treat as the answer
+                raw_final = response.replace("Thought:", "").strip()
+                break
+
+            # ── Phase 2: Emit sources metadata ─────────────────────────────────
+            seen_urls = set()
+            unique_sources = []
+            for doc in self._agent_sources:
+                url = getattr(doc, "metadata", {}).get("url", "")
+                if url:
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        unique_sources.append(doc)
+                else:
+                    unique_sources.append(doc)
+
+            serialized_sources = []
+            for doc in unique_sources:
+                meta = getattr(doc, "metadata", {}) or {}
+                serialized_sources.append({
+                    "collection": getattr(doc, "collection", ""),
+                    "score": getattr(doc, "score", 0),
+                    "text": (getattr(doc, "text", "") or "")[:1200],
+                    "metadata": meta,
+                    "url": meta.get("url", ""),
+                })
+
+            yield {
+                "type": "metadata",
+                "intent": parsed.intent,
+                "filters": parsed.filters,
+                "sources": serialized_sources,
+            }
+
+            # ── Phase 3: Stream the final answer ───────────────────────────────
+            # Clean prompt — only user query + raw draft, no ReAct history.
+            stream_prompt = (
+                f"Câu hỏi của người dùng: {user_query}\n\n"
+                f"Thông tin tổng hợp từ tra cứu:\n{raw_final}\n\n"
+                "Dựa trên thông tin trên, hãy viết câu trả lời hoàn chỉnh dưới "
+                "dạng Markdown rõ ràng, có cấu trúc, dễ đọc. Chỉ xuất nội dung "
+                "câu trả lời."
+            )
+
+            yield {"type": "status", "text": "✍️ Đang tạo câu trả lời..."}
+            for token in self._llm.generate_stream(
+                prompt=stream_prompt,
+                system_prompt=SYSTEM_PROMPT,
+                temperature=0.3,
+            ):
+                yield {"type": "chunk", "text": token}
+
+            yield {"type": "done"}
+
         else:
             # Fallback for offline LLM
             from rag.llm import LLMClient
