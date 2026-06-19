@@ -26,10 +26,7 @@ from crawlers import (
     YouTubeCrawler,
     TikTokCrawler,
     VozCrawler,
-    GoogleReviewsCrawler,
-    OSMPOI,
 )
-from crawlers.config import GOOGLE_MAPS_API_KEY
 
 def generate_keywords_from_listings(data_dir: Path, max_keywords: int = 15) -> list[str]:
     """
