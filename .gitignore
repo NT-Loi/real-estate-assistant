@@ -1,5 +1,6 @@
 .venv
-data
+data/
+logs/
 __pycache__
 .vscode
 .env
@@ -8,7 +9,7 @@ docs
 rag
 scratch
 scripts
-db_data
+# db_data
 .agents
 .codex
 *.ipynb

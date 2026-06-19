@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 
 DATASET = Path(__file__).with_name("real_estate_queries.testset.jsonl")
@@ -31,6 +33,17 @@ VALID_EDGE_TYPES = {
     "comparison",
     "boundary_value",
 }
+MOJIBAKE_MARKERS = ("Ã", "Ä", "Æ", "áº", "á»", "Â", "�")
+SUSPICIOUS_QUESTION_MARK = re.compile(r"\?\?|[A-Za-zÀ-ỹ]\?[A-Za-zÀ-ỹ]")
+BAD_REPAIR_PHRASES = (
+    "khôngủ",
+    "hơnào",
+    "nhiưu",
+    "Đông bán kính",
+    "khơng",
+    "tiền sông",
+    "đỏ dịch",
+)
 
 
 def fail(message: str) -> None:
@@ -56,6 +69,17 @@ def load_cases() -> list[dict]:
                 fail(f"Line {line_no} is not a JSON object")
             cases.append(case)
     return cases
+
+
+def iter_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from iter_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_strings(child)
 
 
 def validate(cases: list[dict]) -> None:
@@ -92,6 +116,15 @@ def validate(cases: list[dict]) -> None:
         for field in REQUIRED_FIELDS - {"required_filters_or_inputs"}:
             if not isinstance(case[field], str) or not case[field].strip():
                 fail(f"{case['id']} field {field} must be a non-empty string")
+
+        for text in iter_strings(case):
+            if any(marker in text for marker in MOJIBAKE_MARKERS):
+                fail(f"{case['id']} appears to contain mojibake text: {text[:80]}")
+            if SUSPICIOUS_QUESTION_MARK.search(text):
+                fail(f"{case['id']} appears to contain lossy '?' replacement text: {text[:80]}")
+            for phrase in BAD_REPAIR_PHRASES:
+                if phrase in text:
+                    fail(f"{case['id']} appears to contain an over-repaired phrase: {text[:80]}")
 
 
 def main() -> None:

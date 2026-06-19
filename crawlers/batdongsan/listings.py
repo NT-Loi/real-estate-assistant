@@ -50,13 +50,11 @@ class ListingCrawler(BaseCrawler):
 
     async def _wait_for_listings(self, page: Page) -> bool:
         """Wait until listing cards are visible on the page."""
-        for selector in [".js__card", "[data-tracking-id]", ".re__card-full"]:
-            try:
-                await page.wait_for_selector(selector, timeout=20_000)
-                return True
-            except Exception:
-                continue
-        return False
+        try:
+            await page.wait_for_selector(".js__card, [data-tracking-id], .re__card-full", timeout=45_000)
+            return True
+        except Exception:
+            return False
 
     async def _extract_cards(self, page: Page) -> List[Dict[str, Any]]:
         """Run Javascript extraction to collect all listing cards from current page."""
@@ -433,6 +431,8 @@ class ListingCrawler(BaseCrawler):
         async with async_playwright() as pw:
             browser = await launch_browser(pw)
             
+            consecutive_empty_pages = 0
+
             for pg in range(start_page, max_pages + 1):
                 url = self.listing_url if pg == 1 else f"{self.listing_url}/p{pg}"
                 context = None
@@ -468,8 +468,18 @@ class ListingCrawler(BaseCrawler):
                     context = None
 
                 if not cards:
-                    self.log.error(f"Still no listings on page {pg} after retries. Stop crawler.")
-                    break
+                    consecutive_empty_pages += 1
+                    self.log.error(
+                        f"Still no listings on page {pg} after retries. "
+                        f"Skipping page ({consecutive_empty_pages}/3 consecutive empty pages)."
+                    )
+                    self.checkpoint_mgr.save(pg, [])
+                    if consecutive_empty_pages >= 3:
+                        self.log.error("Reached 3 consecutive empty listing pages. Stop crawler.")
+                        break
+                    continue
+
+                consecutive_empty_pages = 0
 
                 self.log.info(f"Extracted {len(cards)} listings on page {pg}")
 

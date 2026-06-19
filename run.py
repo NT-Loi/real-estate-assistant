@@ -261,6 +261,18 @@ def parse_args():
         help="Automatically generate location-corresponding review keywords from crawled listings & projects.",
     )
     parser.add_argument(
+        "--max-videos-per-keyword",
+        type=int,
+        default=20,
+        help="Maximum videos to collect per keyword for YouTube/TikTok/VOZ search crawlers.",
+    )
+    parser.add_argument(
+        "--max-comments-per-video",
+        type=int,
+        default=50,
+        help="Maximum comments to collect per video for YouTube/TikTok crawlers.",
+    )
+    parser.add_argument(
         "--geocode-limit",
         type=int,
         default=0,
@@ -335,7 +347,12 @@ async def run_crawlers_async(args):
     elif args.type == "youtube":
         crawler = YouTubeCrawler()
         review_keywords = resolve_keywords()
-        await crawler.crawl(keywords=review_keywords, max_videos_per_kw=20, max_comments_per_video=50, resume=args.resume)
+        await crawler.crawl(
+            keywords=review_keywords,
+            max_videos_per_kw=args.max_videos_per_keyword,
+            max_comments_per_video=args.max_comments_per_video,
+            resume=args.resume
+        )
  
     # 6. TikTok Comments (keyword search + direct URLs)
     elif args.type == "tiktok":
@@ -344,8 +361,8 @@ async def run_crawlers_async(args):
         await crawler.crawl(
             urls=url_list if url_list else None,
             keywords=review_keywords if review_keywords else None,
-            max_videos_per_kw=20,
-            max_comments_per_video=50,
+            max_videos_per_kw=args.max_videos_per_keyword,
+            max_comments_per_video=args.max_comments_per_video,
             resume=args.resume
         )
  
@@ -357,7 +374,7 @@ async def run_crawlers_async(args):
             keywords=review_keywords if review_keywords else None,
             max_pages=args.pages,
             max_threads_per_page=20,
-            max_threads_per_kw=20,
+            max_threads_per_kw=args.max_videos_per_keyword,
             visit_posts=visit,
             resume=args.resume
         )
@@ -447,13 +464,13 @@ async def run_crawlers_async(args):
         
         log.info("--- 6. VOZ Neighborhood Forums ---")
         current_kws = resolve_keywords()
-        await VozCrawler().crawl(keywords=current_kws if current_kws else None, max_pages=args.pages, max_threads_per_page=20, max_threads_per_kw=20, visit_posts=visit, resume=args.resume)
+        await VozCrawler().crawl(keywords=current_kws if current_kws else None, max_pages=args.pages, max_threads_per_page=20, max_threads_per_kw=args.max_videos_per_keyword, visit_posts=visit, resume=args.resume)
         
         log.info("--- 7. YouTube Neighborhood Reviews ---")
-        await YouTubeCrawler().crawl(keywords=current_kws, max_videos_per_kw=20, max_comments_per_video=30, resume=args.resume)
+        await YouTubeCrawler().crawl(keywords=current_kws, max_videos_per_kw=args.max_videos_per_keyword, max_comments_per_video=args.max_comments_per_video, resume=args.resume)
         
         log.info("--- 8. TikTok Neighborhood Discussions ---")
-        await TikTokCrawler().crawl(urls=url_list[:2] if url_list else None, keywords=current_kws if current_kws else None, max_videos_per_kw=20, max_comments_per_video=30, resume=args.resume)
+        await TikTokCrawler().crawl(urls=url_list[:2] if url_list else None, keywords=current_kws if current_kws else None, max_videos_per_kw=args.max_videos_per_keyword, max_comments_per_video=args.max_comments_per_video, resume=args.resume)
         
         if GOOGLE_MAPS_API_KEY:
             log.info("--- 9. Google Maps Places Reviews ---")
