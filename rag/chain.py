@@ -479,13 +479,35 @@ class RAGChain:
             return f"Lỗi khi tìm kiếm vị trí bản đồ: {e}"
 
     def _tool_read_url(self, url: str) -> str:
-        """Read full content of a URL using Jina Reader API."""
+        """Read full content of a URL using Tavily Extract API."""
         try:
             log.info(f"Tool called: read_url({url=})")
+            import os
             import requests
-            r = requests.get(f"https://r.jina.ai/{url}", timeout=15)
+            
+            api_key = os.getenv("TAVILY_API") or os.getenv("TAVILY_API_KEY")
+            if not api_key:
+                return "Lỗi: Không tìm thấy TAVILY_API trong file .env"
+                
+            payload = {
+                "api_key": api_key,
+                "urls": [url]
+            }
+            
+            r = requests.post("https://api.tavily.com/extract", json=payload, timeout=15)
             r.raise_for_status()
-            content = r.text
+            
+            data = r.json()
+            results = data.get("results", [])
+            failed = data.get("failed_results", [])
+            
+            if failed and any(f.get("url") == url for f in failed):
+                return f"Lỗi từ Tavily Extract API: Không thể trích xuất {url}"
+                
+            if not results:
+                return f"Không có dữ liệu trả về cho {url}"
+                
+            content = results[0].get("raw_content") or ""
             
             max_len = 6000
             if len(content) > max_len:

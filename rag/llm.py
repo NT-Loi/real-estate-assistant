@@ -43,13 +43,13 @@ class LLMClient:
     ):
         self._provider = provider or os.environ.get("LLM_PROVIDER", "").lower()
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
-        self._model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self._model_name = model_name or os.environ.get("GEMINI_MODEL")
 
         self._project_id = os.environ.get("PROJECT_ID", "")
         self._vertex_location = os.environ.get("VERTEX_LOCATION", "global")
 
         self._ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-        self._ollama_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+        self._ollama_model = os.environ.get("OLLAMA_MODEL")
 
         self._client = None
         self._available = False

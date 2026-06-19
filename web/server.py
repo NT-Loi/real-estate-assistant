@@ -244,7 +244,7 @@ async def lifespan(app: FastAPI):
         if RAG_CHAIN is not None:
             llm = RAG_CHAIN._llm
             provider = getattr(llm, "_provider", "unknown")
-            model = getattr(llm, "_ollama_model", None) or getattr(llm, "_model_name", "unknown")
+            model = getattr(llm, "_ollama_model") or getattr(llm, "_model_name")
             available = getattr(llm, "is_available", False)
             if available:
                 # Send a trivial generation to warm up the model cache
