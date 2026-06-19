@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import logging
 from typing import Optional, Tuple, List, Dict, Any
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
@@ -7,6 +9,10 @@ from pathlib import Path
 from crawlers.config import CONTEXT_OPTS, STEALTH_SCRIPT
 
 log = logging.getLogger("bds_crawler.browser")
+
+class CloudflareBlockedError(Exception):
+    """Exception raised when Cloudflare blocks the crawler and cookies need renewal."""
+    pass
 
 def _parse_netscape_cookies(file_path: Path) -> List[Dict[str, Any]]:
     """Parse Netscape cookies into a list of dicts suitable for Playwright context.add_cookies()."""
@@ -85,4 +91,20 @@ async def goto_safe(page: Page, url: str, retries: int = 3, sleep_on_fail: float
             if attempt == retries - 1:
                 return False
             await asyncio.sleep(sleep_on_fail)
+    return False
+
+async def check_and_renew_cloudflare(page: Page) -> bool:
+    """Check if Cloudflare is blocking. If so, synchronously run renew_cookies.py and raise CloudflareBlockedError."""
+    title = await page.title()
+    cf_titles = ["Chờ một chút", "Xác minh bảo mật", "Just a moment", "Cloudflare"]
+    if any(kw in title for kw in cf_titles):
+        log.warning(f"Cloudflare block detected ('{title}'). Pausing to auto-renew cookies...")
+        try:
+            # sys.executable is the venv python
+            subprocess.run([sys.executable, "crawlers/renew_cookies.py"], check=True)
+            log.info("Cookie renewal script finished successfully.")
+        except subprocess.CalledProcessError as e:
+            log.error(f"Cookie renewal script failed with exit code {e.returncode}")
+        
+        raise CloudflareBlockedError("Cloudflare blocked the page. Cookies have been renewed, please retry the context.")
     return False

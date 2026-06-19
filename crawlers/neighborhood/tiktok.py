@@ -146,11 +146,24 @@ class TikTokCrawler(BaseCrawler):
             }
             try:
                 r = requests.get(url, params=params, headers=headers, timeout=15)
-                if r.status_code != 200:
-                    self.log.warning(f"TikTok API returned status code {r.status_code}")
-                    break
+                
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+                    
+                if r.status_code != 200 or data.get("status_code", 0) != 0:
+                    self.log.warning(f"TikTok API blocked (HTTP {r.status_code}, JSON status {data.get('status_code')}). Auto-renewing cookies...")
+                    import subprocess, sys
+                    try:
+                        subprocess.run([sys.executable, "crawlers/renew_tiktok_cookies.py"], check=True)
+                        self.cookie_string = self._load_cookies()
+                        headers = self._get_headers(aweme_id)
+                        continue  # Retry same request
+                    except subprocess.CalledProcessError:
+                        self.log.error("Failed to auto-renew TikTok cookies.")
+                        break
 
-                data = r.json()
                 comments = data.get("comments", [])
                 if not comments:
                     break
@@ -188,8 +201,23 @@ class TikTokCrawler(BaseCrawler):
             }
             try:
                 r = requests.get(url, params=params, headers=headers, timeout=15)
-                if r.status_code != 200:
-                    break
+                
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+
+                if r.status_code != 200 or data.get("status_code", 0) != 0:
+                    self.log.warning(f"TikTok API blocked (HTTP {r.status_code}, JSON status {data.get('status_code')}). Auto-renewing cookies...")
+                    import subprocess, sys
+                    try:
+                        subprocess.run([sys.executable, "crawlers/renew_tiktok_cookies.py"], check=True)
+                        self.cookie_string = self._load_cookies()
+                        headers = self._get_headers(aweme_id)
+                        continue  # Retry same request
+                    except subprocess.CalledProcessError:
+                        self.log.error("Failed to auto-renew TikTok cookies.")
+                        break
 
                 data = r.json()
                 replies = data.get("comments", [])

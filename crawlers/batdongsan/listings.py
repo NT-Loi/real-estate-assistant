@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from playwright.async_api import async_playwright, Page
 
 from crawlers.base import BaseCrawler
-from crawlers.browser import launch_browser, new_stealth_page, goto_safe
+from crawlers.browser import launch_browser, new_stealth_page, goto_safe, check_and_renew_cloudflare, CloudflareBlockedError
 from crawlers.config import LISTING_URLS, BASE_URL, REQUEST_DELAY
 
 SPEC_KEY_MAP = {
@@ -137,15 +137,11 @@ class ListingCrawler(BaseCrawler):
             self.log.info(f"  Visiting detail: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             
-            # Check for Cloudflare / Security Verification wall
-            title = await page.title()
-            is_cf = any(kw in title for kw in ["Chờ một chút", "Xác minh bảo mật", "Just a moment", "Cloudflare"])
-            self.log.info(f"  Page title: '{title}' (Security wall: {is_cf})")
-            if is_cf:
-                self.log.info("  Waiting 12 seconds for auto-redirect...")
-                await asyncio.sleep(12)
-            else:
-                await asyncio.sleep(3)
+            try:
+                await check_and_renew_cloudflare(page)
+            except CloudflareBlockedError:
+                self.log.warning("Detail page hit Cloudflare, but cookies are now renewed. Skipping this specific detail fetch to avoid infinite detail loops, but subsequent list pages will work.")
+                return {}
 
             # Wait for content to load to ensure bypass succeeded
             try:
@@ -433,7 +429,8 @@ class ListingCrawler(BaseCrawler):
         async with async_playwright() as pw:
             browser = await launch_browser(pw)
             
-            for pg in range(start_page, max_pages + 1):
+            pg = start_page
+            while pg <= max_pages:
                 # Fresh browser context per page to thwart session/cookie tracking
                 context, page = await new_stealth_page(browser)
                 
@@ -443,7 +440,14 @@ class ListingCrawler(BaseCrawler):
                 if not await goto_safe(page, url):
                     self.log.warning(f"Failed to navigate to {url}. Skipping page {pg}")
                     await context.close()
+                    pg += 1
                     continue
+
+                try:
+                    await check_and_renew_cloudflare(page)
+                except CloudflareBlockedError:
+                    await context.close()
+                    continue  # Retry the exact same page `pg` because cookies were renewed!
 
                 await asyncio.sleep(5)
                 found = await self.sleep_polite() or await self._wait_for_listings(page)
@@ -501,6 +505,7 @@ class ListingCrawler(BaseCrawler):
                 await context.close()
                 self.checkpoint_mgr.save(pg, page_listings)
                 await self.sleep_polite(REQUEST_DELAY * 2)
+                pg += 1
 
             await browser.close()
             
