@@ -15,13 +15,25 @@ class CheckpointManager:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_file = self.checkpoint_dir / f"checkpoint_{crawler_name}.json"
         self.seen_urls: Set[str] = set()
-        self.state: Dict[str, Any] = {}
-        self.load()
+        self.state: Dict[str, Any] = {"last_page": 0, "processed_items": [], "seen_urls": []}
 
     def load(self) -> None:
-        """Load checkpoint file if it exists."""
+        """Load checkpoint file if it exists. Otherwise, try to infer seen_urls from existing final data."""
         if not self.checkpoint_file.exists():
             self.state = {"last_page": 0, "processed_items": [], "seen_urls": []}
+            # Try to build seen_urls from final output to support incremental skip
+            output_file = self.checkpoint_dir.parent / f"{self.crawler_name}.json"
+            if output_file.exists():
+                try:
+                    with open(output_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            urls = [i["url"] for i in data if isinstance(i, dict) and i.get("url")]
+                            self.seen_urls = set(urls)
+                            self.state["seen_urls"] = list(self.seen_urls)
+                            log.info(f"Initialized seen_urls from existing output. Count: {len(self.seen_urls)}")
+                except Exception:
+                    pass
             return
 
         try:

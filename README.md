@@ -100,9 +100,10 @@ cd ..
 
 Before running the chatbot, populate the databases with crawled real estate data. The offline crawler pulls listings, news, and social media data. OpenStreetMap data is not pre-crawled; the agent will search it dynamically during chats!
 
-> **⚠️ Note on Social Crawling Requirements**: 
-> 1. **TikTok**: You must provide a valid `cookies.txt` file (Netscape format) in the project root to bypass anti-bot challenges.
-> 2. **YouTube**: You must configure `YOUTUBE_API_KEY` in your `.env` file to successfully fetch video transcripts and comments.
+> **⚠️ Note on Crawling Requirements**: 
+> 1. **Batdongsan**: If you get blocked by Cloudflare verification ("Just a moment..."), export your browser's cookies for `batdongsan.com.vn` into a `cookies_bds.txt` file (Netscape format) in the project root.
+> 2. **TikTok**: You must provide a valid `cookies.txt` file (Netscape format) in the project root to bypass anti-bot challenges.
+> 3. **YouTube**: You must configure `YOUTUBE_API_KEY` in your `.env` file to successfully fetch video transcripts and comments.
 
 ```bash
 # 1. Crawl active property listings & project profiles

@@ -1,11 +1,52 @@
-import asyncio
+import os
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
+from pathlib import Path
 
 from crawlers.config import CONTEXT_OPTS, STEALTH_SCRIPT
 
 log = logging.getLogger("bds_crawler.browser")
+
+def _parse_netscape_cookies(file_path: Path) -> List[Dict[str, Any]]:
+    """Parse Netscape cookies into a list of dicts suitable for Playwright context.add_cookies()."""
+    playwright_cookies = []
+    if not file_path.exists():
+        return playwright_cookies
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+                    continue
+                
+                is_httponly = False
+                if line.startswith("#HttpOnly_"):
+                    is_httponly = True
+                    line = line[10:]
+                
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookie = {
+                        "domain": parts[0],
+                        "path": parts[2],
+                        "secure": parts[3].lower() == "true",
+                        "name": parts[5],
+                        "value": parts[6],
+                        "httpOnly": is_httponly,
+                    }
+                    try:
+                        expires = int(parts[4])
+                        if expires > 0:
+                            cookie["expires"] = expires
+                    except ValueError:
+                        pass
+                    playwright_cookies.append(cookie)
+    except Exception as e:
+        log.error(f"Error parsing cookies from {file_path}: {e}")
+        
+    return playwright_cookies
 
 async def launch_browser(pw: Playwright, headless: bool = True) -> Browser:
     """Launch chromium browser with automation control features disabled."""
@@ -19,8 +60,16 @@ async def launch_browser(pw: Playwright, headless: bool = True) -> Browser:
     )
 
 async def new_stealth_page(browser: Browser) -> Tuple[BrowserContext, Page]:
-    """Create a new browser context with stealth injections and custom options."""
+    """Create a new browser context with stealth injections, custom options, and optional cookies."""
     context = await browser.new_context(**CONTEXT_OPTS)
+    
+    # Attempt to load batdongsan.com.vn cookies if provided to bypass Cloudflare
+    cookie_file = Path("cookies_bds.txt")
+    if cookie_file.exists():
+        cookies = _parse_netscape_cookies(cookie_file)
+        if cookies:
+            await context.add_cookies(cookies)
+            
     await context.add_init_script(STEALTH_SCRIPT)
     page = await context.new_page()
     return context, page

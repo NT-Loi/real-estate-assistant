@@ -68,6 +68,10 @@ class WikiCrawler(NewsCrawler):
 
                     cards = await self._extract_article_cards(page)
                     self.log.info(f"Extracted {len(cards)} wiki cards from page {pg}")
+                    if not cards:
+                        self.log.info(f"No wiki cards found on page {pg}. Stopping pagination.")
+                        await context.close()
+                        break
 
                     page_articles = []
                     for idx, card in enumerate(cards):
