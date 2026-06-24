@@ -53,15 +53,22 @@ class VectorStore:
         total = len(documents)
         log.info(f"Adding {total} items to Qdrant + PostgreSQL in collection '{collection_name}'")
 
-        # 1. Store structured raw payloads in PostgreSQL
+        # 1. Store structured raw payloads in PostgreSQL. A source record may
+        # produce multiple vector chunks, so de-duplicate by relational ID.
         if records:
             log.info(f"Committing {len(records)} structured records to PostgreSQL '{collection_name}'")
             try:
+                seen_record_ids: set[str] = set()
                 for idx, r in enumerate(records):
                     # Attach ID dynamically so relational rows match vector points
                     if "id" not in r:
                         r["id"] = ids[idx] if idx < len(ids) else ids[0]
-                        
+
+                    record_id = str(r.get("id") or "")
+                    if record_id and record_id in seen_record_ids:
+                        continue
+                    seen_record_ids.add(record_id)
+
                     if collection_name == "listings":
                         self.pg.upsert_listing(r)
                     elif collection_name == "projects":
@@ -81,7 +88,6 @@ class VectorStore:
             batch_ids = ids[start:end]
             batch_meta = metadatas[start:end]
 
-            # Generate embeddings (384-dimensions)
             embeddings = self._embedder.embed(batch_docs)
 
             self.qdrant.add_documents(

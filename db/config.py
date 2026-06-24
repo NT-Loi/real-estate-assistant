@@ -7,16 +7,29 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT / "data-Loi"
 
 # ---------------------------------------------------------------------------
 # Embedding model
 # ---------------------------------------------------------------------------
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-EMBEDDING_DIM = 384
+EMBEDDING_MODEL = "AITeamVN/Vietnamese_Embedding_v2"
+EMBEDDING_DIM = 1024
+EMBEDDING_MAX_TOKENS = 2048
+EMBEDDING_NORMALIZE = True
+QDRANT_DISTANCE = "DOT"
 
 # ---------------------------------------------------------------------------
-# ChromaDB collection names
+# Reranking
+# ---------------------------------------------------------------------------
+import os
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "AITeamVN/Vietnamese_Reranker")
+ENABLE_RERANKER = os.getenv("ENABLE_RERANKER", "true").lower() in {"1", "true", "yes", "on"}
+RERANKER_MAX_LENGTH = 2304
+RERANKER_CANDIDATES = 60
+RERANKER_KEEP = 10
+
+# ---------------------------------------------------------------------------
+# Qdrant collection names
 # ---------------------------------------------------------------------------
 COLLECTION_LISTINGS = "listings"
 COLLECTION_PROJECTS = "projects"
@@ -26,18 +39,17 @@ COLLECTION_SOCIAL    = "social_neighborhood"
 # ---------------------------------------------------------------------------
 # Chunking
 # ---------------------------------------------------------------------------
-# Articles: 800 chars per chunk (up from 500) — Vietnamese BDS analysis
-# articles average 1500-3000 chars per topic section. Larger chunks keep
-# more context per embedding, reducing retrieval fragmentation.
-ARTICLE_CHUNK_SIZE    = 800
-ARTICLE_CHUNK_OVERLAP = 100
-MAX_LISTING_TEXT_LENGTH = 2000  # chars — listings are single-chunk
-MAX_PROJECT_TEXT_LENGTH = 3000  # chars — projects may need 1-2 chunks
+# Vietnamese_Embedding_v2 supports 2048 tokens. We stay below that so the title,
+# source prefix, and prompt-side context do not push chunks into truncation.
+CHUNK_TARGET_TOKENS = 900
+CHUNK_OVERLAP_TOKENS = 120
+ARTICLE_CHUNK_SIZE = CHUNK_TARGET_TOKENS
+ARTICLE_CHUNK_OVERLAP = CHUNK_OVERLAP_TOKENS
+SOCIAL_COMMENT_BATCH_TOKENS = 700
 
 # ---------------------------------------------------------------------------
 # Gemini / LLM
 # ---------------------------------------------------------------------------
-import os
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 # gemini-2.0-flash  — fast, cheap, great for structured extraction + RAG answers

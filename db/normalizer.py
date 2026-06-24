@@ -15,6 +15,7 @@ Examples:
         → ("TP Hồ Chí Minh", "Quận 7")
 """
 import re
+from urllib.parse import urlparse
 from typing import Optional
 
 
@@ -228,6 +229,24 @@ def normalize_label(raw: Optional[str]) -> Optional[str]:
     return text or None
 
 
+def _metadata_float(raw: Optional[str]) -> Optional[float]:
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return parse_float_field(str(raw))
+
+
+def _url_host(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    try:
+        return urlparse(raw).netloc.lower()
+    except Exception:
+        return ""
+
+
 def normalize_listing_metadata(record: dict) -> dict:
     """
     Extract normalized metadata from a merged listing record.
@@ -253,7 +272,10 @@ def normalize_listing_metadata(record: dict) -> dict:
         "phap_ly": normalize_label(record.get("phap_ly")) or "unknown",
         "noi_that": normalize_label(record.get("noi_that")) or "unknown",
         "url": record.get("url") or "",
+        "url_host": _url_host(record.get("url")),
         "ngay_dang": record.get("ngay_dang") or "",
+        "geo_source": record.get("geo_source") or "",
+        "geo_confidence": str(record.get("geo_confidence") or ""),
     }
 
     # Numeric fields — ChromaDB supports numeric filtering
@@ -278,6 +300,13 @@ def normalize_listing_metadata(record: dict) -> dict:
     if bathrooms is not None:
         meta["so_phong_tam"] = bathrooms
 
+    lat = _metadata_float(record.get("latitude") or record.get("lat"))
+    lng = _metadata_float(record.get("longitude") or record.get("lng") or record.get("lon"))
+    if lat is not None:
+        meta["latitude"] = lat
+    if lng is not None:
+        meta["longitude"] = lng
+
     return meta
 
 
@@ -300,7 +329,16 @@ def normalize_project_metadata(record: dict) -> dict:
         "trang_thai": normalize_label(record.get("trang_thai")) or "unknown",
         "gia_raw": record.get("gia") or "",
         "url": record.get("url") or "",
+        "url_host": _url_host(record.get("url")),
+        "geo_source": record.get("geo_source") or "",
+        "geo_confidence": str(record.get("geo_confidence") or ""),
     }
+    lat = _metadata_float(record.get("latitude") or record.get("lat"))
+    lng = _metadata_float(record.get("longitude") or record.get("lng") or record.get("lon"))
+    if lat is not None:
+        meta["latitude"] = lat
+    if lng is not None:
+        meta["longitude"] = lng
     return meta
 
 
@@ -313,6 +351,7 @@ def normalize_article_metadata(record: dict) -> dict:
         "tac_gia": record.get("tac_gia") or "unknown",
         "ngay_dang": record.get("ngay_dang") or "",
         "url": record.get("url") or "",
+        "url_host": _url_host(record.get("url")),
     }
     return meta
 

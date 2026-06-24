@@ -11,6 +11,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
@@ -149,6 +150,7 @@ class RAGChain:
         self._retriever = Retriever(self._store)
         self._llm = llm or LLMClient()
         self._agent_sources = []
+        self._current_parsed: Optional[ParsedQuery] = None
 
         # Eagerly load the embedding model to avoid cold-start during first chat query
         if hasattr(self._store, "_embedder") and hasattr(self._store._embedder, "_load"):
@@ -161,14 +163,31 @@ class RAGChain:
     # ---------------------------------------------------------------------------
     # Tools definition
     # ---------------------------------------------------------------------------
-    def _tool_semantic_search(self, query_text: str, collections: list[str], limit: int = 5) -> str:
+    def _default_collections(self, collections: Optional[list[str]]) -> list[str]:
+        if collections:
+            return collections
+        if self._current_parsed and self._current_parsed.collections:
+            return self._current_parsed.collections
+        return ["articles", "social_neighborhood"]
+
+    def _current_filters(self) -> dict:
+        return self._current_parsed.filters if self._current_parsed else {}
+
+    def _current_lifestyle_signals(self) -> list[str]:
+        return self._current_parsed.lifestyle_signals if self._current_parsed else []
+
+    def _tool_semantic_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 5) -> str:
         """Run semantic search on Qdrant."""
         try:
+            collections = self._default_collections(collections)
             log.info(f"Tool called: semantic_search({query_text=}, {collections=}, {limit=})")
             docs = self._retriever.retrieve(
                 query_text=query_text,
                 collections=collections,
-                top_k=limit
+                filters=self._current_filters(),
+                top_k=limit,
+                per_collection_k=max(12, limit * 4),
+                lifestyle_signals=self._current_lifestyle_signals(),
             )
             if not docs:
                 return "Không tìm thấy kết quả tìm kiếm ngữ nghĩa nào."
@@ -177,47 +196,38 @@ class RAGChain:
         except Exception as e:
             return f"Lỗi khi tìm kiếm ngữ nghĩa: {e}"
 
-    def _tool_keyword_search(self, query_text: str, collections: list[str], limit: int = 5) -> str:
+    def _tool_hybrid_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 5) -> str:
+        """Run dense + keyword retrieval, followed by reranking when available."""
+        try:
+            collections = self._default_collections(collections)
+            log.info(f"Tool called: hybrid_search({query_text=}, {collections=}, {limit=})")
+            docs = self._retriever.hybrid_retrieve(
+                query_text=query_text,
+                collections=collections,
+                filters=self._current_filters(),
+                top_k=limit,
+                per_collection_k=max(20, limit * 6),
+                lifestyle_signals=self._current_lifestyle_signals(),
+            )
+            if not docs:
+                return "Không tìm thấy kết quả phù hợp từ tìm kiếm hybrid."
+            self._agent_sources.extend(docs)
+            return format_context(docs)
+        except Exception as e:
+            return f"Lỗi khi tìm kiếm hybrid: {e}"
+
+    def _tool_keyword_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 5) -> str:
         """Run exact keyword search using ILIKE on PostgreSQL."""
         try:
+            collections = self._default_collections(collections)
             log.info(f"Tool called: keyword_search({query_text=}, {collections=}, {limit=})")
-            results = []
-            with self._store.pg.get_cursor() as cur:
-                for coll in collections:
-                    if coll == "listings":
-                        q = "SELECT raw_json FROM listings WHERE tieu_de ILIKE %s OR mo_ta ILIKE %s LIMIT %s"
-                        cur.execute(q, (f"%{query_text}%", f"%{query_text}%", limit))
-                    elif coll == "projects":
-                        q = "SELECT raw_json FROM projects WHERE ten_du_an ILIKE %s OR khu_vuc ILIKE %s LIMIT %s"
-                        cur.execute(q, (f"%{query_text}%", f"%{query_text}%", limit))
-                    elif coll == "articles":
-                        q = "SELECT raw_json FROM articles WHERE tieu_de ILIKE %s OR mo_ta ILIKE %s LIMIT %s"
-                        cur.execute(q, (f"%{query_text}%", f"%{query_text}%", limit))
-                    else:
-                        continue
-                    
-                    rows = cur.fetchall()
-                    for r in rows:
-                        payload = r[0]
-                        if isinstance(payload, str):
-                            payload = json.loads(payload)
-                        results.append((coll, payload))
-            
-            if not results:
+            docs = self._retriever.keyword_retrieve(
+                query_text=query_text,
+                collections=collections,
+                top_k=limit,
+            )
+            if not docs:
                 return "Không tìm thấy kết quả từ khóa chính xác nào."
-            
-            from rag.retriever import RetrievedDocument
-            docs = []
-            for coll, r in results[:limit]:
-                desc = r.get("mo_ta_chi_tiet") or r.get("mo_ta") or r.get("tieu_de") or str(r)
-                doc = RetrievedDocument(
-                    text=desc,
-                    metadata={"url": r.get("url", "")},
-                    score=1.0,
-                    collection=coll,
-                    record=r
-                )
-                docs.append(doc)
             self._agent_sources.extend(docs)
             return format_context(docs)
         except Exception as e:
@@ -285,17 +295,19 @@ class RAGChain:
             limit = int(kwargs.get("limit", 5))
             
             where_sql = " AND ".join(clauses)
-            sql = f"SELECT raw_json FROM listings WHERE {where_sql} {order_by} LIMIT %s"
+            sql = f"SELECT id, raw_json FROM listings WHERE {where_sql} {order_by} LIMIT %s"
             params.append(limit)
             
             results = []
             with self._store.pg.get_cursor() as cur:
                 cur.execute(sql, tuple(params))
                 rows = cur.fetchall()
-                for r in rows:
-                    payload = r[0]
+                for row_id, raw_payload in rows:
+                    payload = raw_payload
                     if isinstance(payload, str):
                         payload = json.loads(payload)
+                    if isinstance(payload, dict):
+                        payload["id"] = payload.get("id") or row_id
                     results.append(payload)
                     
             if not results:
@@ -314,7 +326,11 @@ class RAGChain:
                 
                 doc = RetrievedDocument(
                     text=text_content,
-                    metadata={"url": url},
+                    metadata={
+                        "url": url,
+                        "source_record_id": r.get("id") or "",
+                        "chunk_type": "structured_filter",
+                    },
                     score=1.0,
                     collection="listings",
                     record=r
@@ -324,6 +340,42 @@ class RAGChain:
             return format_context(docs)
         except Exception as e:
             return f"Lỗi khi lọc bất động sản: {e}"
+
+    def _tool_find_nearby_pois(
+        self,
+        entity_ids: list[str],
+        entity_type: str = "listing",
+        categories: Optional[list[str]] = None,
+        radius_m: float = 1500,
+        top_n_per_category: int = 5,
+    ) -> str:
+        """Find nearby amenities for listing/project source IDs."""
+        try:
+            if not entity_ids:
+                return "Thiếu entity_ids để tìm tiện ích lân cận."
+            categories = categories or ["transit_station", "school", "hospital", "park", "shopping"]
+            poi_map = self._store.pg.fetch_nearby_pois(
+                entity_ids=entity_ids,
+                entity_type=entity_type,
+                categories=categories,
+                radius_m=radius_m,
+                top_n_per_category=top_n_per_category,
+            )
+            lines = []
+            for entity_id, pois in poi_map.items():
+                lines.append(f"Tiện ích quanh {entity_type} {entity_id}:")
+                if not pois:
+                    lines.append("- Chưa có POI trong bán kính yêu cầu.")
+                    continue
+                for poi in pois:
+                    dist = poi.get("distance_m")
+                    dist_text = f"{dist:.0f}m" if isinstance(dist, (int, float)) else "chưa rõ khoảng cách"
+                    lines.append(
+                        f"- {poi.get('category')}: {poi.get('name')} ({dist_text})"
+                    )
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Lỗi khi tìm tiện ích lân cận: {e}"
 
     def _tool_analyze_market_trend(self, **kwargs) -> str:
         """Analyze historical market trends and compare property price."""
@@ -541,17 +593,25 @@ class RAGChain:
         if tool_name == "semantic_search":
             return self._tool_semantic_search(
                 query_text=args.get("query_text", ""),
-                collections=args.get("collections", []),
+                collections=args.get("collections"),
+                limit=args.get("limit", 5)
+            )
+        elif tool_name == "hybrid_search":
+            return self._tool_hybrid_search(
+                query_text=args.get("query_text", ""),
+                collections=args.get("collections"),
                 limit=args.get("limit", 5)
             )
         elif tool_name == "keyword_search":
             return self._tool_keyword_search(
                 query_text=args.get("query_text", ""),
-                collections=args.get("collections", []),
+                collections=args.get("collections"),
                 limit=args.get("limit", 5)
             )
         elif tool_name == "filter_listings":
             return self._tool_filter_listings(**args)
+        elif tool_name == "find_nearby_pois":
+            return self._tool_find_nearby_pois(**args)
         elif tool_name == "analyze_market_trend":
             return self._tool_analyze_market_trend(**args)
         elif tool_name == "get_market_statistics":
@@ -577,6 +637,7 @@ class RAGChain:
         
         # Step 1: Parse query for initial fallback/metadata tracking
         parsed = self._parser.parse(user_query)
+        self._current_parsed = parsed
 
         # Step 2: System prompt setup
         from rag.prompts import REACT_SYSTEM_PROMPT, SYSTEM_PROMPT
@@ -679,6 +740,7 @@ class RAGChain:
 
         self._agent_sources = []
         parsed = self._parser.parse(user_query)
+        self._current_parsed = parsed
 
         from rag.prompts import REACT_SYSTEM_PROMPT, SYSTEM_PROMPT
         agent_prompt = (

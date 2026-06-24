@@ -1,303 +1,308 @@
 """
-Chunker — convert raw crawled records into embeddable text chunks.
+Chunker - convert crawled records into focused embeddable text chunks.
 
-Strategies:
-    - Listings & Projects: template-format all fields into a single natural
-      language string (short enough to embed as one chunk).
-    - Articles (News/Wiki): split long body text into overlapping segments
-      using recursive character splitting.
+The active embedding model is AITeamVN/Vietnamese_Embedding_v2 (BGE-M3 based),
+which supports long Vietnamese context. We still chunk by semantic sections so
+retrieval can hit the exact part of a listing, project, article, or discussion.
 """
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any
 
-from db.config import ARTICLE_CHUNK_SIZE, ARTICLE_CHUNK_OVERLAP
-
-
-# ---------------------------------------------------------------------------
-# Listing → text
-# ---------------------------------------------------------------------------
-def listing_to_text(record: dict) -> str:
-    """
-    Format a merged listing record into a natural language string
-    suitable for embedding.
-    """
-    parts: list[str] = []
-
-    # Date prefix for recency filtering
-    date = record.get("ngay_dang") or record.get("posted_at")
-    if date:
-        parts.append(f"[{str(date)[:10]}]")
-
-    # Title
-    if record.get("tieu_de"):
-        parts.append(record["tieu_de"])
-
-    # Property type + location
-    loc_parts = []
-    if record.get("loai_nha_dat"):
-        loc_parts.append(record["loai_nha_dat"])
-    addr = record.get("dia_chi") or record.get("khu_vuc")
-    if addr:
-        loc_parts.append(f"tại {addr}")
-    if loc_parts:
-        parts.append(". ".join(loc_parts))
-
-    # Project name (useful for lifestyle/project queries)
-    if record.get("du_an"):
-        parts.append(f"Thuộc dự án: {record['du_an']}")
-
-    # Price + Area
-    price_area = []
-    if record.get("gia"):
-        price_area.append(f"Giá: {record['gia']}")
-    if record.get("dien_tich"):
-        price_area.append(f"Diện tích: {record['dien_tich']}")
-    if record.get("gia_per_m2"):
-        price_area.append(f"Giá/m²: {record['gia_per_m2']}")
-    if price_area:
-        parts.append(", ".join(price_area))
-
-    # Rooms
-    rooms = []
-    if record.get("so_phong_ngu"):
-        rooms.append(f"{record['so_phong_ngu']} phòng ngủ")
-    if record.get("so_phong_tam"):
-        rooms.append(f"{record['so_phong_tam']} phòng tắm/toilet")
-    if rooms:
-        parts.append(", ".join(rooms))
-
-    # Orientation
-    orient = []
-    if record.get("huong_nha"):
-        orient.append(f"Hướng nhà: {record['huong_nha']}")
-    if record.get("huong_ban_cong"):
-        orient.append(f"Hướng ban công: {record['huong_ban_cong']}")
-    if orient:
-        parts.append(", ".join(orient))
-
-    # Extra specs
-    extras = []
-    if record.get("phap_ly"):
-        extras.append(f"Pháp lý: {record['phap_ly']}")
-    if record.get("noi_that"):
-        extras.append(f"Nội thất: {record['noi_that']}")
-    if record.get("so_tang"):
-        extras.append(f"Số tầng: {record['so_tang']}")
-    if record.get("mat_tien"):
-        extras.append(f"Mặt tiền: {record['mat_tien']}")
-    if record.get("duong_vao"):
-        extras.append(f"Đường vào: {record['duong_vao']}")
-    if extras:
-        parts.append(". ".join(extras))
-
-    # Description
-    desc = record.get("mo_ta_chi_tiet") or record.get("mo_ta")
-    if desc:
-        # Truncate very long descriptions
-        parts.append(desc[:1500])
-
-    text = ". ".join(parts)
-    # Normalize whitespace
-    return re.sub(r"\s+", " ", text).strip()
+from db.config import (
+    CHUNK_OVERLAP_TOKENS,
+    CHUNK_TARGET_TOKENS,
+    SOCIAL_COMMENT_BATCH_TOKENS,
+)
 
 
-# ---------------------------------------------------------------------------
-# Project → text
-# ---------------------------------------------------------------------------
-def project_to_text(record: dict) -> str:
-    """Format a project record into embeddable text."""
-    parts: list[str] = []
-
-    # Date prefix
-    date = record.get("ngay_dang") or record.get("posted_at")
-    if date:
-        parts.append(f"[{str(date)[:10]}]")
-
-    if record.get("ten_du_an"):
-        parts.append(f"Dự án: {record['ten_du_an']}")
-
-    info = []
-    if record.get("loai_du_an"):
-        info.append(record["loai_du_an"])
-    addr = record.get("dia_chi") or record.get("khu_vuc")
-    if addr:
-        info.append(f"tại {addr}")
-    if info:
-        parts.append(". ".join(info))
-
-    if record.get("chu_dau_tu"):
-        parts.append(f"Chủ đầu tư: {record['chu_dau_tu']}")
-    if record.get("quy_mo"):
-        parts.append(f"Quy mô: {record['quy_mo']}")
-    if record.get("so_can_ho"):
-        parts.append(f"Số căn hộ: {record['so_can_ho']}")
-    if record.get("gia"):
-        parts.append(f"Giá: {record['gia']}")
-    if record.get("dien_tich"):
-        parts.append(f"Diện tích: {record['dien_tich']}")
-    if record.get("trang_thai"):
-        parts.append(f"Trạng thái: {record['trang_thai']}")
-    if record.get("phap_ly"):
-        parts.append(f"Pháp lý: {record['phap_ly']}")
-    if record.get("nam_ban_giao"):
-        parts.append(f"Bàn giao: {record['nam_ban_giao']}")
-
-    if record.get("tien_ich"):
-        tien_ich = record["tien_ich"]
-        if isinstance(tien_ich, list):
-            tien_ich = ", ".join(tien_ich)
-        parts.append(f"Tiện ích: {tien_ich}")
-
-    desc = record.get("mo_ta_chi_tiet")
-    if desc:
-        parts.append(desc[:2000])
-
-    text = ". ".join(parts)
-    return re.sub(r"\s+", " ", text).strip()
+Chunk = dict[str, Any]
 
 
-# ---------------------------------------------------------------------------
-# Article → chunks
-# ---------------------------------------------------------------------------
-def _split_text(
+def _clean(text: Any) -> str:
+    if text is None:
+        return ""
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def _append(parts: list[str], label: str, value: Any) -> None:
+    text = _clean(value)
+    if text:
+        parts.append(f"{label}: {text}")
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lightweight tokenizer for chunk sizing without loading the HF tokenizer."""
+    return re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+
+
+def _detokenize(tokens: list[str]) -> str:
+    text = " ".join(tokens)
+    text = re.sub(r"\s+([,.;:!?%)\]])", r"\1", text)
+    text = re.sub(r"([(\[])\s+", r"\1", text)
+    return text.strip()
+
+
+def _split_text_by_tokens(
     text: str,
-    chunk_size: int = ARTICLE_CHUNK_SIZE,
-    chunk_overlap: int = ARTICLE_CHUNK_OVERLAP,
+    target_tokens: int = CHUNK_TARGET_TOKENS,
+    overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
 ) -> list[str]:
-    """
-    Split text into overlapping chunks by paragraph boundaries first,
-    then by sentence boundaries, then by character.
-    """
-    if len(text) <= chunk_size:
-        return [text]
+    """Split long Vietnamese text into token-budgeted chunks."""
+    text = _clean(text)
+    if not text:
+        return []
 
-    # Split by double newline (paragraphs)
-    paragraphs = re.split(r"\n\s*\n", text)
-    paragraphs = [p.strip() for p in paragraphs if p.strip()]
-
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     chunks: list[str] = []
-    current_chunk = ""
+    current: list[str] = []
 
-    for para in paragraphs:
-        # If adding this paragraph would exceed chunk_size
-        if len(current_chunk) + len(para) + 1 > chunk_size:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-                # Overlap: keep tail of current chunk
-                if chunk_overlap > 0 and len(current_chunk) > chunk_overlap:
-                    current_chunk = current_chunk[-chunk_overlap:]
-                else:
-                    current_chunk = ""
+    def flush() -> None:
+        nonlocal current
+        if current:
+            chunks.append(_detokenize(current))
+            current = current[-overlap_tokens:] if overlap_tokens > 0 else []
 
-            # If a single paragraph is too long, split by sentences
-            if len(para) > chunk_size:
-                sentences = re.split(r"(?<=[.!?])\s+", para)
-                for sent in sentences:
-                    if len(current_chunk) + len(sent) + 1 > chunk_size:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                            if chunk_overlap > 0 and len(current_chunk) > chunk_overlap:
-                                current_chunk = current_chunk[-chunk_overlap:]
-                            else:
-                                current_chunk = ""
-                        # If a single sentence is still too long, hard-split
-                        if len(sent) > chunk_size:
-                            for i in range(0, len(sent), chunk_size - chunk_overlap):
-                                chunks.append(sent[i : i + chunk_size])
-                        else:
-                            current_chunk = sent
-                    else:
-                        current_chunk = (current_chunk + " " + sent).strip()
-            else:
-                current_chunk = (current_chunk + " " + para).strip()
-        else:
-            current_chunk = (current_chunk + "\n\n" + para).strip()
+    for para in paragraphs or [text]:
+        para_tokens = _tokenize(para)
+        if not para_tokens:
+            continue
 
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
+        if len(para_tokens) > target_tokens:
+            flush()
+            step = max(1, target_tokens - overlap_tokens)
+            for start in range(0, len(para_tokens), step):
+                window = para_tokens[start : start + target_tokens]
+                if window:
+                    chunks.append(_detokenize(window))
+            current = []
+            continue
 
+        if len(current) + len(para_tokens) > target_tokens:
+            flush()
+
+        current.extend(para_tokens)
+
+    if current:
+        chunks.append(_detokenize(current))
+
+    return [c for c in chunks if c]
+
+
+def _make_chunks(prefix: str, chunk_type: str, bodies: list[str]) -> list[Chunk]:
+    texts = [f"{prefix}. {body}".strip(". ") if prefix else body for body in bodies if _clean(body)]
+    total = len(texts)
+    return [
+        {
+            "text": _clean(text),
+            "chunk_type": chunk_type,
+            "chunk_index": idx,
+            "total_chunks": total,
+        }
+        for idx, text in enumerate(texts)
+        if _clean(text)
+    ]
+
+
+def _date_prefix(record: dict) -> str:
+    date = record.get("ngay_dang") or record.get("posted_at") or record.get("published_at")
+    return f"[{str(date)[:10]}] " if date else ""
+
+
+def listing_fact_text(record: dict) -> str:
+    parts: list[str] = []
+    if record.get("tieu_de"):
+        parts.append(_clean(record["tieu_de"]))
+    _append(parts, "Loại hình", record.get("loai_hinh"))
+    _append(parts, "Loại nhà đất", record.get("loai_nha_dat"))
+    _append(parts, "Địa chỉ", record.get("dia_chi") or record.get("khu_vuc"))
+    _append(parts, "Dự án", record.get("du_an"))
+    _append(parts, "Giá", record.get("gia"))
+    _append(parts, "Giá mỗi m2", record.get("gia_per_m2"))
+    _append(parts, "Diện tích", record.get("dien_tich"))
+    _append(parts, "Phòng ngủ", record.get("so_phong_ngu"))
+    _append(parts, "Phòng tắm", record.get("so_phong_tam"))
+    _append(parts, "Hướng nhà", record.get("huong_nha"))
+    _append(parts, "Hướng ban công", record.get("huong_ban_cong"))
+    _append(parts, "Pháp lý", record.get("phap_ly"))
+    _append(parts, "Nội thất", record.get("noi_that"))
+    _append(parts, "Số tầng", record.get("so_tang"))
+    _append(parts, "Mặt tiền", record.get("mat_tien"))
+    _append(parts, "Đường vào", record.get("duong_vao"))
+    return _clean(". ".join(parts))
+
+
+def listing_to_chunks(record: dict) -> list[Chunk]:
+    """Return fact and description chunks for one listing."""
+    prefix = _date_prefix(record) + "Tin bất động sản"
+    chunks = _make_chunks(prefix, "facts", [listing_fact_text(record)])
+
+    desc = record.get("mo_ta_chi_tiet") or record.get("mo_ta")
+    title = _clean(record.get("tieu_de"))
+    desc_prefix = f"{_date_prefix(record)}Mô tả tin: {title}" if title else f"{_date_prefix(record)}Mô tả tin"
+    desc_chunks = _make_chunks(
+        desc_prefix,
+        "description",
+        _split_text_by_tokens(desc),
+    )
+
+    all_chunks = chunks + desc_chunks
+    total = len(all_chunks)
+    for idx, chunk in enumerate(all_chunks):
+        chunk["chunk_index"] = idx
+        chunk["total_chunks"] = total
+    return all_chunks
+
+
+def listing_to_text(record: dict) -> str:
+    """Compatibility wrapper: join all listing chunks into one text."""
+    return " ".join(chunk["text"] for chunk in listing_to_chunks(record))
+
+
+def project_fact_text(record: dict) -> str:
+    parts: list[str] = []
+    _append(parts, "Dự án", record.get("ten_du_an"))
+    _append(parts, "Loại dự án", record.get("loai_du_an"))
+    _append(parts, "Địa chỉ", record.get("dia_chi") or record.get("khu_vuc"))
+    _append(parts, "Chủ đầu tư", record.get("chu_dau_tu"))
+    _append(parts, "Quy mô", record.get("quy_mo"))
+    _append(parts, "Số căn hộ", record.get("so_can_ho"))
+    _append(parts, "Giá", record.get("gia"))
+    _append(parts, "Diện tích", record.get("dien_tich"))
+    _append(parts, "Trạng thái", record.get("trang_thai"))
+    _append(parts, "Pháp lý", record.get("phap_ly"))
+    _append(parts, "Bàn giao", record.get("nam_ban_giao"))
+    return _clean(". ".join(parts))
+
+
+def _project_amenities(record: dict) -> str:
+    amenities = record.get("tien_ich")
+    if isinstance(amenities, list):
+        amenities = ", ".join(_clean(x) for x in amenities if _clean(x))
+    return _clean(amenities)
+
+
+def project_to_chunks(record: dict) -> list[Chunk]:
+    """Return fact, amenity, and description chunks for one project."""
+    name = _clean(record.get("ten_du_an"))
+    prefix = f"{_date_prefix(record)}Dự án {name}" if name else f"{_date_prefix(record)}Dự án bất động sản"
+
+    chunks = _make_chunks(prefix, "facts", [project_fact_text(record)])
+    chunks += _make_chunks(prefix, "amenities", [f"Tiện ích: {_project_amenities(record)}"])
+    chunks += _make_chunks(
+        prefix,
+        "description",
+        _split_text_by_tokens(record.get("mo_ta_chi_tiet")),
+    )
+
+    all_chunks = [c for c in chunks if c["text"]]
+    total = len(all_chunks)
+    for idx, chunk in enumerate(all_chunks):
+        chunk["chunk_index"] = idx
+        chunk["total_chunks"] = total
+    return all_chunks
+
+
+def project_to_text(record: dict) -> str:
+    """Compatibility wrapper: join all project chunks into one text."""
+    return " ".join(chunk["text"] for chunk in project_to_chunks(record))
+
+
+def article_to_chunks(record: dict) -> list[Chunk]:
+    """Convert one news/wiki article into token-budgeted chunks."""
+    title = _clean(record.get("tieu_de") or record.get("title"))
+    body = record.get("mo_ta_chi_tiet") or record.get("noi_dung") or record.get("content") or record.get("mo_ta")
+    category = _clean(record.get("danh_muc") or record.get("category"))
+    date = _date_prefix(record)
+    prefix_parts = [date.strip(), f"[{category}]" if category else "", title]
+    prefix = _clean(" ".join(p for p in prefix_parts if p))
+
+    bodies = _split_text_by_tokens(body)
+    if not bodies and title:
+        bodies = [_clean(record.get("mo_ta") or title)]
+    return _make_chunks(prefix, "article_body", bodies)
+
+
+def _comment_text(comment: dict) -> str:
+    text = (
+        comment.get("comment_norm")
+        or comment.get("comment_raw")
+        or comment.get("content")
+        or comment.get("text")
+        or ""
+    )
+    return _clean(text)
+
+
+def _comment_batches(comments: list[dict], target_tokens: int) -> list[str]:
+    batches: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    for comment in comments:
+        text = _comment_text(comment)
+        if len(text) <= 5:
+            continue
+        line = f"- {text}"
+        size = len(_tokenize(line))
+        if size > target_tokens:
+            if current:
+                batches.append("\n".join(current))
+                current = []
+                current_tokens = 0
+            batches.extend(f"- {part}" for part in _split_text_by_tokens(text, target_tokens, 0))
+            continue
+        if current and current_tokens + size > target_tokens:
+            batches.append("\n".join(current))
+            current = []
+            current_tokens = 0
+        current.append(line)
+        current_tokens += size
+
+    if current:
+        batches.append("\n".join(current))
+    return batches
+
+
+def social_to_chunks(record: dict) -> list[Chunk]:
+    """Split one social/video/forum record into summary and comment chunks."""
+    source = _clean(record.get("source_type") or "mạng xã hội").upper()
+    keyword = _clean(record.get("keyword"))
+    title = _clean(record.get("title") or record.get("thread_title"))
+    desc = _clean(record.get("text_content") or record.get("description") or record.get("transcript_text"))
+
+    summary_parts = [
+        _date_prefix(record).strip(),
+        f"Nguồn: {source}",
+        f"Chủ đề/khu vực: {keyword}" if keyword else "",
+        f"Tiêu đề: {title}" if title else "",
+    ]
+    chunks = _make_chunks("", "summary", [" ".join(p for p in summary_parts if p)])
+    chunks += _make_chunks(
+        f"Nội dung từ {source}" + (f" về {keyword}" if keyword else ""),
+        "content",
+        _split_text_by_tokens(desc),
+    )
+
+    comments = record.get("comments") or record.get("posts") or []
+    if isinstance(comments, list):
+        prefix = f"Ý kiến người dùng từ {source}"
+        if keyword:
+            prefix += f" về {keyword}"
+        chunks += _make_chunks(
+            prefix,
+            "comments",
+            _comment_batches(comments, SOCIAL_COMMENT_BATCH_TOKENS),
+        )
+
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks):
+        chunk["chunk_index"] = idx
+        chunk["total_chunks"] = total
     return chunks
 
 
-def article_to_chunks(record: dict) -> list[tuple[str, int, int]]:
-    """
-    Convert an article record into a list of (chunk_text, chunk_index, total_chunks).
-
-    The chunk text includes the article category + title as a prefix for retrieval context.
-
-    Field name note: DB stores full body as 'mo_ta_chi_tiet', but some crawlers
-    use 'noi_dung'. We check both to handle both sources correctly.
-    """
-    title = record.get("tieu_de") or ""
-    # Read body from DB field (mo_ta_chi_tiet) or crawler field (noi_dung) or short summary (mo_ta)
-    body = record.get("mo_ta_chi_tiet") or record.get("noi_dung") or record.get("mo_ta") or ""
-    danh_muc = record.get("danh_muc") or ""
-    date = record.get("ngay_dang") or record.get("published_at")
-    date_prefix = f"[{str(date)[:10]}] " if date else ""
-    cat_prefix = f"[{danh_muc}] " if danh_muc else ""
-
-    if not body:
-        # No content — use title + summary as single chunk
-        text = f"{date_prefix}{cat_prefix}{title}"
-        if record.get("mo_ta") and record["mo_ta"] not in text:
-            text += ". " + record["mo_ta"]
-        return [(text, 0, 1)] if text.strip() else []
-
-    raw_chunks = _split_text(body)
-    total = len(raw_chunks)
-
-    result: list[tuple[str, int, int]] = []
-    for i, chunk in enumerate(raw_chunks):
-        # Prefix each chunk with date + category + title for retrieval context
-        prefixed = f"{date_prefix}{cat_prefix}{title}. {chunk}" if title else f"{date_prefix}{cat_prefix}{chunk}"
-        prefixed = re.sub(r"\s+", " ", prefixed).strip()
-        result.append((prefixed, i, total))
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Social neighborhood → text
-# ---------------------------------------------------------------------------
 def social_to_text(record: dict) -> str:
-    """Format social platform discussions into cohesive semantic text suitable for embedding."""
-    parts = []
-    source = record.get("source_type", "mạng xã hội").upper()
-    kw = record.get("keyword")
-
-    # Date prefix for recency
-    date = record.get("published_at") or record.get("ngay_dang")
-    if date:
-        parts.append(f"[{str(date)[:10]}]")
-
-    if kw:
-        parts.append(f"Ý kiến thảo luận và đánh giá thực tế về {kw} trên {source}.")
-    else:
-        parts.append(f"Thảo luận thực tế trên mạng xã hội {source}.")
-
-    title = record.get("title") or record.get("thread_title")
-    if title:
-        parts.append(f"Nội dung thảo luận: '{title}'.")
-
-    desc = record.get("text_content") or record.get("description")
-    if desc:
-        parts.append(f"Chi tiết thảo luận: {desc[:600]}")
-
-    # Capture top comments to represent actual neighborhood sentiment
-    comments = record.get("comments") or record.get("posts") or []
-    if comments:
-        feedback = []
-        for c in comments[:6]:
-            txt = c.get("comment_norm") or c.get("comment_raw") or c.get("content")
-            if txt and len(txt.strip()) > 5:
-                # Remove extra formatting
-                txt_clean = re.sub(r"\s+", " ", txt).strip()
-                feedback.append(f"\"{txt_clean[:200]}\"")
-        if feedback:
-            parts.append("Nhận xét thực tế từ người dân: " + ", ".join(feedback))
-
-    text = " ".join(parts)
-    return re.sub(r"\s+", " ", text).strip()
-
+    """Compatibility wrapper: join all social chunks into one text."""
+    return " ".join(chunk["text"] for chunk in social_to_chunks(record))

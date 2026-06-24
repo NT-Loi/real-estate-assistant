@@ -11,7 +11,7 @@ from typing import Union
 
 from sentence_transformers import SentenceTransformer
 
-from db.config import EMBEDDING_MODEL
+from db.config import EMBEDDING_MODEL, EMBEDDING_NORMALIZE
 
 log = logging.getLogger("bds_embedder")
 
@@ -56,7 +56,11 @@ class Embedder:
         model = self._load()
         if isinstance(texts, str):
             texts = [texts]
-        embeddings = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
+        embeddings = model.encode(
+            texts,
+            show_progress_bar=False,
+            normalize_embeddings=EMBEDDING_NORMALIZE,
+        )
         return embeddings.tolist()
 
     @property

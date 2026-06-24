@@ -805,11 +805,11 @@ class PostgresClient:
             "id": item["id"],
             "tieu_de": item.get("tieu_de") or item.get("title"),
             "mo_ta": item.get("mo_ta") or item.get("description"),
-            "mo_ta_chi_tiet": item.get("mo_ta_chi_tiet") or item.get("content"),
+            "mo_ta_chi_tiet": item.get("mo_ta_chi_tiet") or item.get("noi_dung") or item.get("content"),
             "url": item.get("url"),
-            "source_type": item.get("source_type"),
+            "source_type": item.get("source_type") or item.get("loai"),
             "danh_muc": item.get("danh_muc") or item.get("category"),
-            "ngay_dang": item.get("ngay_dang") or item.get("date"),
+            "ngay_dang": item.get("ngay_dang") or item.get("published_at") or item.get("date"),
             "raw_json": json.dumps(item)
         }
         
@@ -959,10 +959,83 @@ class PostgresClient:
                         payload = json.loads(payload_str)
                     else:
                         payload = payload_str  # parsed natively by psycopg2 jsonb adapter
+                    if isinstance(payload, dict):
+                        payload["id"] = payload.get("id") or item_id
                     results.append(payload)
         except Exception as e:
             log.warning(f"Error fetching from table {table_name}: {e}")
         return results
+
+    def fetch_nearby_pois(
+        self,
+        entity_ids: List[str],
+        entity_type: str = "listing",
+        categories: Optional[List[str]] = None,
+        radius_m: float = 1500,
+        top_n_per_category: int = 5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetch nearby POIs for listing/project IDs using PostGIS distance."""
+        if not entity_ids:
+            return {}
+
+        if entity_type not in {"listing", "project"}:
+            raise ValueError("entity_type must be 'listing' or 'project'")
+
+        source_table = "listings" if entity_type == "listing" else "projects"
+        category_filter = ""
+        params: list[Any] = [entity_ids, radius_m]
+        if categories:
+            category_filter = "AND p.category = ANY(%s)"
+            params.append(categories)
+
+        q = f"""
+            WITH source_entities AS (
+                SELECT id, geom
+                FROM {source_table}
+                WHERE id = ANY(%s) AND geom IS NOT NULL
+            ),
+            ranked AS (
+                SELECT
+                    s.id AS entity_id,
+                    p.id,
+                    p.name,
+                    p.category,
+                    p.address,
+                    p.latitude,
+                    p.longitude,
+                    p.rating,
+                    p.review_count,
+                    ST_Distance(s.geom, p.geom) AS distance_m,
+                    row_number() OVER (
+                        PARTITION BY s.id, p.category
+                        ORDER BY ST_Distance(s.geom, p.geom)
+                    ) AS rn
+                FROM source_entities s
+                JOIN pois p
+                  ON p.geom IS NOT NULL
+                 AND ST_DWithin(s.geom, p.geom, %s)
+                {category_filter}
+            )
+            SELECT entity_id, id, name, category, address, latitude, longitude,
+                   rating, review_count, distance_m
+            FROM ranked
+            WHERE rn <= %s
+            ORDER BY entity_id, category, distance_m;
+        """
+        params.append(top_n_per_category)
+
+        output: Dict[str, List[Dict[str, Any]]] = {entity_id: [] for entity_id in entity_ids}
+        try:
+            with self.get_cursor() as cur:
+                cur.execute(q, tuple(params))
+                cols = [d[0] for d in cur.description]
+                for row in cur.fetchall():
+                    item = dict(zip(cols, row))
+                    entity_id = item.pop("entity_id")
+                    output.setdefault(entity_id, []).append(item)
+        except Exception as e:
+            log.warning(f"fetch_nearby_pois failed: {e}")
+        return output
 
     def fetch_market_stats(
         self,

@@ -1,5 +1,5 @@
 """
-Retriever — Semantic search across ChromaDB collections with metadata filtering.
+Retriever — dense, keyword, and hybrid search across Qdrant/PostgreSQL.
 
 Searches relevant collections based on parsed query intent, applies structured
 filters, and returns ranked results.
@@ -10,7 +10,9 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from db.config import ENABLE_RERANKER, RERANKER_CANDIDATES
 from db.vectorstore import VectorStore
+from rag.reranker import VietnameseReranker
 
 log = logging.getLogger("bds_retriever")
 
@@ -73,6 +75,7 @@ class Retriever:
 
     def __init__(self, store: Optional[VectorStore] = None):
         self._store = store or VectorStore()
+        self._reranker = VietnameseReranker() if ENABLE_RERANKER else None
 
     def retrieve(
         self,
@@ -100,6 +103,8 @@ class Retriever:
             List of RetrievedDocument sorted by relevance score
         """
         all_docs: list[RetrievedDocument] = []
+        if not collections:
+            collections = ["articles", "social_neighborhood"]
 
         for coll_name in collections:
             try:
@@ -110,12 +115,112 @@ class Retriever:
             except Exception as e:
                 log.warning(f"Search failed on '{coll_name}': {e}")
 
-        # Sort by score (highest first) and deduplicate
         all_docs.sort(key=lambda d: d.score, reverse=True)
         all_docs = self._deduplicate(all_docs)
+        if self._reranker and all_docs:
+            all_docs = self._reranker.rerank(query_text, all_docs[:RERANKER_CANDIDATES], top_k)
         result = all_docs[:top_k]
 
         return result
+
+    def hybrid_retrieve(
+        self,
+        query_text: str,
+        collections: list[str],
+        filters: Optional[dict] = None,
+        top_k: int = 5,
+        per_collection_k: int = 20,
+        lifestyle_signals: Optional[list[str]] = None,
+    ) -> list[RetrievedDocument]:
+        """Combine dense Qdrant candidates with PostgreSQL keyword candidates."""
+        dense_docs = self.retrieve(
+            query_text=query_text,
+            collections=collections,
+            filters=filters,
+            top_k=RERANKER_CANDIDATES,
+            per_collection_k=per_collection_k,
+            lifestyle_signals=lifestyle_signals,
+        )
+        keyword_docs = self.keyword_retrieve(
+            query_text=query_text,
+            collections=collections,
+            top_k=RERANKER_CANDIDATES,
+        )
+        merged = self._merge_candidates(dense_docs + keyword_docs)
+        if self._reranker and merged:
+            return self._reranker.rerank(query_text, merged[:RERANKER_CANDIDATES], top_k)
+        merged.sort(key=lambda d: d.score, reverse=True)
+        return merged[:top_k]
+
+    def keyword_retrieve(
+        self,
+        query_text: str,
+        collections: list[str],
+        top_k: int = 10,
+    ) -> list[RetrievedDocument]:
+        """Keyword fallback over PostgreSQL source tables."""
+        if not collections:
+            collections = ["articles", "social_neighborhood"]
+
+        docs: list[RetrievedDocument] = []
+        query_like = f"%{query_text}%"
+
+        try:
+            with self._store.pg.get_cursor() as cur:
+                for coll in collections:
+                    if coll == "listings":
+                        cur.execute(
+                            """
+                            SELECT id, raw_json FROM listings
+                            WHERE tieu_de ILIKE %s OR mo_ta ILIKE %s OR mo_ta_chi_tiet ILIKE %s
+                               OR dia_chi ILIKE %s OR khu_vuc ILIKE %s OR du_an ILIKE %s
+                            LIMIT %s
+                            """,
+                            (query_like, query_like, query_like, query_like, query_like, query_like, top_k),
+                        )
+                    elif coll == "projects":
+                        cur.execute(
+                            """
+                            SELECT id, raw_json FROM projects
+                            WHERE ten_du_an ILIKE %s OR mo_ta_chi_tiet ILIKE %s OR tien_ich::text ILIKE %s
+                               OR dia_chi ILIKE %s OR khu_vuc ILIKE %s OR chu_dau_tu ILIKE %s
+                            LIMIT %s
+                            """,
+                            (query_like, query_like, query_like, query_like, query_like, query_like, top_k),
+                        )
+                    elif coll == "articles":
+                        cur.execute(
+                            """
+                            SELECT id, raw_json FROM articles
+                            WHERE tieu_de ILIKE %s OR mo_ta ILIKE %s OR mo_ta_chi_tiet ILIKE %s
+                               OR danh_muc ILIKE %s
+                            LIMIT %s
+                            """,
+                            (query_like, query_like, query_like, query_like, top_k),
+                        )
+                    elif coll == "social_neighborhood":
+                        cur.execute(
+                            """
+                            SELECT id, raw_json FROM social_neighborhood
+                            WHERE title ILIKE %s OR text_content ILIKE %s OR comments_json::text ILIKE %s
+                               OR keyword ILIKE %s
+                            LIMIT %s
+                            """,
+                            (query_like, query_like, query_like, query_like, top_k),
+                        )
+                    else:
+                        continue
+
+                    for row_id, raw in cur.fetchall():
+                        record = self._decode_record(raw)
+                        if record is None:
+                            continue
+                        record["id"] = record.get("id") or row_id
+                        docs.append(self._record_to_doc(coll, record, score=0.65))
+        except Exception as exc:
+            log.warning("keyword_retrieve failed: %s", exc)
+
+        return self._deduplicate(docs)[:top_k]
 
     def retrieve_market_report(
         self,
@@ -207,11 +312,17 @@ class Retriever:
         metadatas = results["metadatas"][0] if results.get("metadatas") else []
         distances = results["distances"][0] if results.get("distances") else []
 
-        # Hydrate rich contexts from PostgreSQL by point IDs
+        source_ids = [
+            (m or {}).get("source_record_id") or ids[idx]
+            for idx, m in enumerate(metadatas)
+        ]
+
+        # Hydrate rich contexts from PostgreSQL by source record IDs. Qdrant point
+        # IDs are chunk IDs, while PostgreSQL stores one row per source record.
         hydrated_records = {}
         try:
             pg_table = "social_neighborhood" if collection_name == "social_neighborhood" else collection_name
-            records = self._store.pg.fetch_by_ids(pg_table, ids)
+            records = self._store.pg.fetch_by_ids(pg_table, source_ids)
             hydrated_records = {r["id"]: r for r in records if "id" in r}
         except Exception as pg_err:
             log.warning(f"Failed to hydrate from PostgreSQL: {pg_err}")
@@ -222,17 +333,13 @@ class Retriever:
             meta = metadatas[i] if i < len(metadatas) else {}
             dist = distances[i] if i < len(distances) else 1.0
 
-            # Convert cosine distance to similarity score
             score = max(0.0, 1.0 - dist)
+            source_id = meta.get("source_record_id") or doc_id
             
             # Hydrate text using rich metadata fields
-            record = hydrated_records.get(doc_id)
+            record = hydrated_records.get(source_id)
             if record:
-                if collection_name == "listings" and record.get("mo_ta_chi_tiet"):
-                    text = f"{text}. Chi tiết tin đăng: {record['mo_ta_chi_tiet']}"
-                elif collection_name == "projects" and record.get("mo_ta_chi_tiet"):
-                    text = f"{text}. Chi tiết dự án: {record['mo_ta_chi_tiet']}"
-                elif collection_name == "social_neighborhood":
+                if collection_name == "social_neighborhood":
                     title = record.get("title") or ""
                     source = record.get("source_type") or "mạng xã hội"
                     description = text.strip()           # Qdrant chunk = short description
@@ -272,6 +379,8 @@ class Retriever:
                                 lines.append(f"{idx}. [{author}]: {content}")
 
                     text = "\n".join(lines)
+                else:
+                    text = self._attach_record_summary(collection_name, text, record)
 
 
             docs.append(RetrievedDocument(
@@ -329,18 +438,97 @@ class Retriever:
             return {"$and": conditions}
 
     def _deduplicate(self, docs: list[RetrievedDocument]) -> list[RetrievedDocument]:
-        """Remove duplicate documents based on text similarity."""
-        seen_texts: set[str] = set()
+        """Remove exact duplicate chunks while allowing multiple chunk types per record."""
+        seen: set[tuple[str, str, str, str]] = set()
         unique: list[RetrievedDocument] = []
 
         for doc in docs:
-            # Use first 200 chars as dedup key
-            key = doc.text[:200].strip()
-            if key not in seen_texts:
-                seen_texts.add(key)
+            meta = doc.metadata or {}
+            key = (
+                doc.collection,
+                str(meta.get("source_record_id") or meta.get("url") or ""),
+                str(meta.get("chunk_type") or ""),
+                doc.text[:160].strip(),
+            )
+            if key not in seen:
+                seen.add(key)
                 unique.append(doc)
 
         return unique
 
-    # ---------------------------------------------------------------------------
+    def _merge_candidates(self, docs: list[RetrievedDocument]) -> list[RetrievedDocument]:
+        best: dict[tuple[str, str, str], RetrievedDocument] = {}
+        for doc in docs:
+            meta = doc.metadata or {}
+            key = (
+                doc.collection,
+                str(meta.get("source_record_id") or meta.get("url") or doc.text[:80]),
+                str(meta.get("chunk_type") or "record"),
+            )
+            existing = best.get(key)
+            if existing is None or doc.score > existing.score:
+                best[key] = doc
+        merged = list(best.values())
+        merged.sort(key=lambda d: d.score, reverse=True)
+        return merged
 
+    def _decode_record(self, raw):
+        import json
+
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw
+        return None
+
+    def _record_to_doc(self, collection: str, record: dict, score: float) -> RetrievedDocument:
+        if collection == "listings":
+            title = record.get("tieu_de") or "Tin đăng"
+            text = (
+                f"{title}. Giá: {record.get('gia') or 'Thỏa thuận'}, "
+                f"Diện tích: {record.get('dien_tich') or 'Chưa rõ'}, "
+                f"Địa chỉ: {record.get('dia_chi') or record.get('khu_vuc') or 'Chưa rõ'}. "
+                f"{record.get('mo_ta_chi_tiet') or record.get('mo_ta') or ''}"
+            )
+        elif collection == "projects":
+            text = (
+                f"Dự án {record.get('ten_du_an') or ''}. "
+                f"Địa chỉ: {record.get('dia_chi') or record.get('khu_vuc') or 'Chưa rõ'}. "
+                f"Chủ đầu tư: {record.get('chu_dau_tu') or 'Chưa rõ'}. "
+                f"Tiện ích: {', '.join(record.get('tien_ich') or []) if isinstance(record.get('tien_ich'), list) else record.get('tien_ich') or ''}. "
+                f"{record.get('mo_ta_chi_tiet') or ''}"
+            )
+        elif collection == "social_neighborhood":
+            text = (
+                f"{record.get('source_type') or 'social'} - {record.get('title') or record.get('thread_title') or ''}. "
+                f"{record.get('text_content') or record.get('description') or ''}"
+            )
+        else:
+            text = f"{record.get('tieu_de') or record.get('title') or ''}. {record.get('mo_ta_chi_tiet') or record.get('mo_ta') or ''}"
+
+        metadata = {
+            "url": record.get("url") or record.get("thread_url") or "",
+            "source_record_id": record.get("id") or "",
+            "chunk_type": "keyword_record",
+        }
+        return RetrievedDocument(text=text.strip(), metadata=metadata, score=score, collection=collection, record=record)
+
+    def _attach_record_summary(self, collection_name: str, text: str, record: dict) -> str:
+        if collection_name == "listings":
+            summary = (
+                f"Thông tin gốc: {record.get('tieu_de') or ''}. "
+                f"Giá: {record.get('gia') or 'Chưa rõ'}, "
+                f"Diện tích: {record.get('dien_tich') or 'Chưa rõ'}, "
+                f"Địa chỉ: {record.get('dia_chi') or record.get('khu_vuc') or 'Chưa rõ'}."
+            )
+        elif collection_name == "projects":
+            summary = (
+                f"Thông tin gốc: Dự án {record.get('ten_du_an') or ''}. "
+                f"Chủ đầu tư: {record.get('chu_dau_tu') or 'Chưa rõ'}, "
+                f"Địa chỉ: {record.get('dia_chi') or record.get('khu_vuc') or 'Chưa rõ'}."
+            )
+        else:
+            summary = ""
+        return f"{text}\n{summary}".strip()
+
+    # ---------------------------------------------------------------------------

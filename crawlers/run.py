@@ -90,13 +90,15 @@ def parse_args():
         "--type",
         choices=[
             "ban", "cho-thue", "all-listings", "du-an", "tin-tuc", "wiki", 
-            "youtube", "tiktok", "voz", "all"
+            "youtube", "tiktok", "voz", "geocode", "enrich-details", "all"
         ],
         default="ban",
         help=(
             "Type of crawl to run. "
             "Layer 1: 'ban' (sales), 'cho-thue' (rentals), 'all-listings', 'du-an' (projects), 'tin-tuc' (news), 'wiki'. "
             "Layer 2: 'youtube', 'tiktok', 'voz'. "
+            "'geocode' enriches crawled listings/projects with lat/lng. "
+            "'enrich-details' visits existing missing-detail URLs and merges detail fields. "
             "'all' crawls everything."
         ),
     )
@@ -120,6 +122,14 @@ def parse_args():
         help="Load progress checkpoints and resume from last page (preventing duplicates)",
     )
     parser.add_argument(
+        "--fresh-scan",
+        action="store_true",
+        help=(
+            "Start again from page 1 while loading existing output URLs for dedup. "
+            "Use this for incremental top-of-site refreshes where page 1 changes over time."
+        ),
+    )
+    parser.add_argument(
         "--keywords",
         type=str,
         default="",
@@ -136,10 +146,52 @@ def parse_args():
         action="store_true",
         help="Automatically generate location-corresponding review keywords from crawled listings & projects.",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Data directory for geocode/detail enrichment (default: crawlers.config.DATA_DIR).",
+    )
+    parser.add_argument(
+        "--enrich-target",
+        choices=["ban", "cho-thue", "all-listings", "projects", "du-an", "news", "tin-tuc", "wiki", "all"],
+        default="all",
+        help="Dataset to detail-enrich when --type enrich-details is used.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum records to process for --type enrich-details.",
+    )
+    parser.add_argument(
+        "--seed-dir",
+        type=Path,
+        default=None,
+        help="Optional data directory to copy existing lat/lng from before geocoding.",
+    )
+    parser.add_argument(
+        "--max-geocode-requests",
+        type=int,
+        default=None,
+        help="Maximum OSM Nominatim geocoding requests for --type geocode.",
+    )
+    parser.add_argument(
+        "--geocode-delay",
+        type=float,
+        default=1.1,
+        help="Delay between OSM Nominatim requests for --type geocode.",
+    )
     return parser.parse_args()
 
 async def run_crawlers_async(args):
     visit = not args.no_details
+    crawl_resume = args.resume or args.fresh_scan
+
+    def prepare(crawler):
+        if args.fresh_scan:
+            crawler.checkpoint_mgr.clear()
+        return crawler
     
     def resolve_keywords():
         kw_list = [k.strip() for k in args.keywords.split(",") if k.strip()]
@@ -155,50 +207,50 @@ async def run_crawlers_async(args):
 
     # 1. Properties (For Sale / Rent)
     if args.type in ("ban", "cho-thue"):
-        crawler = ListingCrawler(listing_type=args.type)
-        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        crawler = prepare(ListingCrawler(listing_type=args.type))
+        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
 
     elif args.type == "all-listings":
         for lt in ["ban", "cho-thue"]:
-            crawler = ListingCrawler(listing_type=lt)
-            await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+            crawler = prepare(ListingCrawler(listing_type=lt))
+            await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
 
     # 2. Projects
     elif args.type == "du-an":
-        crawler = ProjectCrawler()
-        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        crawler = prepare(ProjectCrawler())
+        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
 
     # 3. News
     elif args.type == "tin-tuc":
-        crawler = NewsCrawler()
-        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        crawler = prepare(NewsCrawler())
+        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
 
     # 4. Wiki
     elif args.type == "wiki":
-        crawler = WikiCrawler()
-        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=args.resume, wiki_category=args.wiki_cat)
+        crawler = prepare(WikiCrawler())
+        await crawler.crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume, wiki_category=args.wiki_cat)
 
     # 5. YouTube Comments & Transcripts
     elif args.type == "youtube":
-        crawler = YouTubeCrawler()
+        crawler = prepare(YouTubeCrawler())
         review_keywords = resolve_keywords()
-        await crawler.crawl(keywords=review_keywords, max_videos_per_kw=20, max_comments_per_video=50, resume=args.resume)
+        await crawler.crawl(keywords=review_keywords, max_videos_per_kw=20, max_comments_per_video=50, resume=crawl_resume)
  
     # 6. TikTok Comments (keyword search + direct URLs)
     elif args.type == "tiktok":
-        crawler = TikTokCrawler()
+        crawler = prepare(TikTokCrawler())
         review_keywords = resolve_keywords()
         await crawler.crawl(
             urls=url_list if url_list else None,
             keywords=review_keywords if review_keywords else None,
             max_videos_per_kw=20,
             max_comments_per_video=50,
-            resume=args.resume
+            resume=crawl_resume
         )
  
     # 7. VOZ Forum Discussions (keyword search or forum browse)
     elif args.type == "voz":
-        crawler = VozCrawler()
+        crawler = prepare(VozCrawler())
         review_keywords = resolve_keywords()
         await crawler.crawl(
             keywords=review_keywords if review_keywords else None,
@@ -206,37 +258,63 @@ async def run_crawlers_async(args):
             max_threads_per_page=20,
             max_threads_per_kw=20,
             visit_posts=visit,
-            resume=args.resume
+            resume=crawl_resume
         )
 
-    # 8. Crawl Everything (Layer 1 + Layer 2)
+    # 8. Geocode listings/projects after crawling
+    elif args.type == "geocode":
+        from crawlers.config import DATA_DIR
+        from crawlers.geocode_enrich import enrich_data_dir
+
+        data_dir = args.data_dir or DATA_DIR
+        stats = enrich_data_dir(
+            data_dir=data_dir,
+            seed_dir=args.seed_dir,
+            max_requests=args.max_geocode_requests,
+            rate_limit_seconds=args.geocode_delay,
+        )
+        log.info(f"Geocode enrichment complete: {stats}")
+
+    elif args.type == "enrich-details":
+        from crawlers.config import DATA_DIR
+        from crawlers.detail_enrich import enrich_details
+
+        data_dir = args.data_dir or DATA_DIR
+        stats = await enrich_details(
+            target=args.enrich_target,
+            data_dir=data_dir,
+            limit=args.limit,
+        )
+        log.info(f"Detail enrichment complete: {stats}")
+
+    # 9. Crawl Everything (Layer 1 + Layer 2)
     elif args.type == "all":
         log.info("Initiating full multi-source catalog collection...")
         
         log.info("--- 1. Property Sale Listings ---")
-        await ListingCrawler(listing_type="ban").crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        await prepare(ListingCrawler(listing_type="ban")).crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
         
         log.info("--- 2. Property Rent Listings ---")
-        await ListingCrawler(listing_type="cho-thue").crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        await prepare(ListingCrawler(listing_type="cho-thue")).crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
         
         log.info("--- 3. Real Estate Projects ---")
-        await ProjectCrawler().crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        await prepare(ProjectCrawler()).crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
         
         log.info("--- 4. Market News ---")
-        await NewsCrawler().crawl(max_pages=args.pages, visit_details=visit, resume=args.resume)
+        await prepare(NewsCrawler()).crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume)
         
         log.info("--- 5. Wiki & Knowledge Base ---")
-        await WikiCrawler().crawl(max_pages=args.pages, visit_details=visit, resume=args.resume, wiki_category=args.wiki_cat)
+        await prepare(WikiCrawler()).crawl(max_pages=args.pages, visit_details=visit, resume=crawl_resume, wiki_category=args.wiki_cat)
         
         log.info("--- 6. VOZ Neighborhood Forums ---")
         current_kws = resolve_keywords()
-        await VozCrawler().crawl(keywords=current_kws if current_kws else None, max_pages=args.pages, max_threads_per_page=20, max_threads_per_kw=20, visit_posts=visit, resume=args.resume)
+        await prepare(VozCrawler()).crawl(keywords=current_kws if current_kws else None, max_pages=args.pages, max_threads_per_page=20, max_threads_per_kw=20, visit_posts=visit, resume=crawl_resume)
         
         log.info("--- 7. YouTube Neighborhood Reviews ---")
-        await YouTubeCrawler().crawl(keywords=current_kws, max_videos_per_kw=20, max_comments_per_video=30, resume=args.resume)
+        await prepare(YouTubeCrawler()).crawl(keywords=current_kws, max_videos_per_kw=20, max_comments_per_video=30, resume=crawl_resume)
         
         log.info("--- 8. TikTok Neighborhood Discussions ---")
-        await TikTokCrawler().crawl(urls=url_list[:2] if url_list else None, keywords=current_kws if current_kws else None, max_videos_per_kw=20, max_comments_per_video=30, resume=args.resume)
+        await prepare(TikTokCrawler()).crawl(urls=url_list[:2] if url_list else None, keywords=current_kws if current_kws else None, max_videos_per_kw=20, max_comments_per_video=30, resume=crawl_resume)
         
         log.info("Consolidated catalog collection sequence completed.")
 

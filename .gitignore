@@ -12,3 +12,7 @@ __pycache__
 data
 docs
 db_data
+
+*.zip
+cookies_bds.txt
+cookies.txt

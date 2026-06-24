@@ -3,7 +3,7 @@ from pathlib import Path
 
 # --- Directory Paths ---
 ROOT_DIR = Path(__file__).parent.parent
-DATA_DIR = ROOT_DIR / "data"
+DATA_DIR = Path(os.getenv("BDS_DATA_DIR", ROOT_DIR / "data"))
 LAW_DIR = DATA_DIR / "laws"
 
 

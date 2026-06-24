@@ -430,6 +430,7 @@ class ListingCrawler(BaseCrawler):
             browser = await launch_browser(pw)
             
             pg = start_page
+            empty_page_retries: Dict[int, int] = {}
             while pg <= max_pages:
                 # Fresh browser context per page to thwart session/cookie tracking
                 context, page = await new_stealth_page(browser)
@@ -458,9 +459,21 @@ class ListingCrawler(BaseCrawler):
                     found = await self._wait_for_listings(page)
                 
                 if not found:
-                    self.log.error(f"Still no listings on page {pg}. Stop crawler.")
+                    retry_count = empty_page_retries.get(pg, 0) + 1
+                    empty_page_retries[pg] = retry_count
+                    if retry_count <= 3:
+                        self.log.warning(
+                            f"Still no listings on page {pg}. Retrying same page "
+                            f"({retry_count}/3) after a fresh context."
+                        )
+                        await context.close()
+                        await self.sleep_polite(REQUEST_DELAY * 2)
+                        continue
+
+                    self.log.error(f"Still no listings on page {pg} after retries. Skipping page.")
                     await context.close()
-                    break
+                    pg += 1
+                    continue
 
                 cards = await self._extract_cards(page)
                 self.log.info(f"Extracted {len(cards)} listings on page {pg}")

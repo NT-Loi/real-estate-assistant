@@ -23,16 +23,16 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator, TYPE_CHECKING
 
 from tqdm import tqdm
 
 from db.config import DATA_DIR
 from db.chunker import (
-    listing_to_text,
-    project_to_text,
+    listing_to_chunks,
+    project_to_chunks,
     article_to_chunks,
-    social_to_text,
+    social_to_chunks,
 )
 from db.normalizer import (
     normalize_listing_metadata,
@@ -46,6 +46,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("bds_ingest")
+
+
+HF_DEFAULT_DATASET = "tinixai/vietnam-real-estates"
+HF_DEFAULT_SPLIT = "train"
+HF_CACHE_FILE = DATA_DIR / "hf_vietnam_real_estates.jsonl"
 
 # Silence noisy sub-loggers during ingestion so tqdm bars are readable
 for _noisy in ("bds_vectorstore", "bds_embedder", "qdrant_client", "httpx"):
@@ -85,7 +90,231 @@ def _count_records(path: Path) -> int:
         return len(data) if isinstance(data, list) else 0
     except Exception:
         return 0
+    
+def _count_jsonl(path: Path) -> int:
+    """Count newline-delimited JSON records."""
+    if not path.exists():
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+    
+def _stream_jsonl(path: Path) -> Iterator[dict]:
+    """Yield records from a JSONL cache file."""
+    if not path.exists():
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
 
+def _first_non_empty(record: dict, *keys: str) -> Any:
+    """Return the first present, non-empty value from several possible field names."""
+    for key in keys:
+        value = record.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _to_float(value: Any) -> float | None:
+    """Best-effort numeric coercion for HuggingFace tabular fields."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        text = str(value).replace(",", ".")
+        import re
+
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+        return float(match.group(0)) if match else None
+
+
+def _to_int(value: Any) -> int | None:
+    """Best-effort integer coercion."""
+    number = _to_float(value)
+    return int(number) if number is not None else None
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    number = _to_int(value)
+    return number if number is not None else default
+
+def _price_to_vnd(value: Any) -> int | None:
+    """
+    Normalize common real-estate dataset price scales into VND.
+
+    The HuggingFace dataset has used numeric price fields in different exports.
+    This heuristic accepts:
+    - large values as already-VND,
+    - 1,000..100,000,000 as million-VND,
+    - smaller values as billion-VND.
+    """
+    number = _to_float(value)
+    if number is None or number <= 0:
+        return None
+    if number >= 100_000_000:
+        return int(number)
+    if number >= 1_000:
+        return int(number * 1_000_000)
+    return int(number * 1_000_000_000)
+
+
+def _vnd_to_label(price_vnd: int | None, listing_type: str = "ban") -> str | None:
+    """Format VND into the crawler's compact Vietnamese price label."""
+    if price_vnd is None:
+        return None
+    suffix = "/tháng" if listing_type == "cho_thue" else ""
+    if price_vnd >= 1_000_000_000:
+        value = price_vnd / 1_000_000_000
+        return f"{value:.2f} tỷ{suffix}".replace(".", ",")
+    value = price_vnd / 1_000_000
+    return f"{value:.0f} triệu{suffix}"
+
+
+def _detect_listing_type(raw: dict) -> str:
+    """Infer sale/rent class from the available dataset fields."""
+    text = " ".join(
+        str(_first_non_empty(raw, key) or "")
+        for key in (
+            "listing_type",
+            "listing_type_name",
+            "transaction_type",
+            "transaction_type_name",
+            "category",
+            "category_name",
+            "type",
+            "url",
+        )
+    ).lower()
+    if any(token in text for token in ("thuê", "thue", "rent", "rental", "lease")):
+        return "cho_thue"
+    return "ban"
+
+
+def _province_address(raw: dict) -> str:
+    """Build a readable address from tabular HuggingFace location columns."""
+    parts = []
+    for key in (
+        "address",
+        "street_name",
+        "ward_name",
+        "district_name",
+        "province_name",
+    ):
+        value = _first_non_empty(raw, key)
+        if value and str(value) not in parts:
+            parts.append(str(value))
+    return ", ".join(parts)
+
+def normalize_hf_listing(raw: dict, row_index: int, dataset_name: str) -> dict:
+    """
+    Convert tinixai/vietnam-real-estates rows into the internal listing schema.
+
+    The output intentionally mirrors crawler fields so existing PostgreSQL and
+    Qdrant ingestion paths can index this external dataset without a new table.
+    """
+    source_id = str(
+        _first_non_empty(raw, "id", "listing_id", "post_id", "url")
+        or row_index
+    )
+    listing_type = _detect_listing_type(raw)
+    price_vnd = _price_to_vnd(_first_non_empty(raw, "price", "price_vnd", "price_value"))
+    area = _to_float(_first_non_empty(raw, "area", "area_m2", "acreage"))
+    price_per_m2_vnd = int(price_vnd / area) if price_vnd and area and area > 0 else None
+
+    title = _first_non_empty(raw, "name", "title", "tieu_de") or "Tin bất động sản"
+    property_type = _first_non_empty(
+        raw,
+        "property_type_name",
+        "property_type",
+        "house_type_name",
+        "realestate_type_name",
+        "category_name",
+    )
+    province = _first_non_empty(raw, "province_name", "province")
+    district = _first_non_empty(raw, "district_name", "district")
+    ward = _first_non_empty(raw, "ward_name", "ward")
+    address = _province_address(raw) or ", ".join(
+        str(v) for v in (ward, district, province) if v
+    )
+    url = _first_non_empty(raw, "url", "link", "source_url") or f"hf://{dataset_name}/{source_id}"
+
+    record = {
+        "loai_hinh": listing_type,
+        "loai_nha_dat": property_type,
+        "khu_vuc": province,
+        "dia_chi": address,
+        "gia": _vnd_to_label(price_vnd, listing_type),
+        "price_vnd": price_vnd,
+        "price_per_m2_vnd": price_per_m2_vnd,
+        "gia_per_m2": _vnd_to_label(price_per_m2_vnd) if price_per_m2_vnd else None,
+        "dien_tich": f"{area:g} m2" if area else None,
+        "dien_tich_m2": area,
+        "so_phong_ngu": _to_int(_first_non_empty(raw, "bedroom_count", "bedrooms", "bedroom")),
+        "so_phong_tam": _to_int(_first_non_empty(raw, "bathroom_count", "bathrooms", "toilet_count")),
+        "huong_nha": _first_non_empty(raw, "house_direction", "direction"),
+        "huong_ban_cong": _first_non_empty(raw, "balcony_direction"),
+        "phap_ly": _first_non_empty(raw, "legal_status", "legal"),
+        "noi_that": _first_non_empty(raw, "furniture", "interior"),
+        "tieu_de": title,
+        "mo_ta": _first_non_empty(raw, "description", "desc", "summary"),
+        "mo_ta_chi_tiet": _first_non_empty(raw, "description", "content", "detail"),
+        "du_an": _first_non_empty(raw, "project_name", "project", "du_an"),
+        "latitude": _to_float(_first_non_empty(raw, "latitude", "lat")),
+        "longitude": _to_float(_first_non_empty(raw, "longitude", "lng", "lon")),
+        "url": url,
+        "ngay_dang": _first_non_empty(raw, "created_at", "posted_at", "published_at", "date"),
+        "nguoi_dang": _first_non_empty(raw, "contact_name", "seller_name", "broker_name"),
+        "source_dataset": dataset_name,
+        "source_record_id": source_id,
+        "source_row_index": row_index,
+        "raw_hf_json": raw,
+    }
+    return record
+
+def _ensure_hf_cache(
+    dataset_name: str,
+    split: str,
+    cache_path: Path,
+    refresh: bool = False,
+    limit: int | None = None,
+) -> Path:
+    """
+    Download/cache a HuggingFace dataset split as JSONL, unless a cache exists.
+
+    Keeping a local JSONL cache makes the PostgreSQL/Qdrant ingest resumable and
+    reproducible for demo day without repeatedly hitting HuggingFace.
+    """
+    if cache_path.exists() and not refresh:
+        return cache_path
+
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "The 'datasets' package is required for HuggingFace ingestion. "
+            "Install requirements.txt first."
+        ) from exc
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Loading HuggingFace dataset %s split=%s", dataset_name, split)
+    ds = load_dataset(dataset_name, split=split)
+
+    written = 0
+    with open(cache_path, "w", encoding="utf-8") as f:
+        for idx, row in enumerate(ds):
+            if limit is not None and written >= limit:
+                break
+            payload = dict(row)
+            payload["_hf_row_index"] = idx
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            written += 1
+
+    log.info("Cached %s HuggingFace rows to %s", written, cache_path)
+    return cache_path
 
 def _social_relevance_score(record: dict) -> float:
     """
@@ -128,7 +357,7 @@ class IngestStats:
     ingested: int = 0
     skipped: int = 0
     errors: int = 0
-    chunks: int = 0  # only for articles
+    chunks: int = 0
 
     def summary(self) -> str:
         parts = [
@@ -206,20 +435,32 @@ def ingest_listings(
                     continue
 
                 try:
-                    doc_id = _make_id("listing", url)
-                    record["id"] = doc_id
-                    text = listing_to_text(record)
-                    meta = normalize_listing_metadata(record)
+                    source_id = _make_id("listing_record", url)
+                    record["id"] = source_id
+                    chunks = listing_to_chunks(record)
+                    base_meta = normalize_listing_metadata(record)
 
-                    if not text.strip():
+                    if not chunks:
                         stats.skipped += 1
                         pbar.set_postfix(skip=stats.skipped, err=stats.errors)
                         continue
 
-                    ids.append(doc_id)
-                    docs.append(text)
-                    metas.append(meta)
-                    recs.append(record)
+                    for chunk in chunks:
+                        chunk_idx = int(chunk["chunk_index"])
+                        ids.append(_make_id("listing", url, chunk_idx))
+                        docs.append(chunk["text"])
+                        metas.append(
+                            {
+                                **base_meta,
+                                "source_record_id": source_id,
+                                "chunk_type": chunk["chunk_type"],
+                                "chunk_index": chunk_idx,
+                                "total_chunks": chunk["total_chunks"],
+                            }
+                        )
+                        recs.append(record)
+                        stats.chunks += 1
+
                     stats.ingested += 1
 
                     if len(ids) >= batch_size:
@@ -245,6 +486,116 @@ def ingest_listings(
     tqdm.write(stats.summary())
     return stats
 
+def ingest_hf_listings(
+    store: VectorStore,
+    reset: bool = False,
+    batch_size: int = 64,
+    dataset_name: str = HF_DEFAULT_DATASET,
+    split: str = HF_DEFAULT_SPLIT,
+    cache_path: Path = HF_CACHE_FILE,
+    refresh_cache: bool = False,
+    limit: int | None = None,
+) -> IngestStats:
+    """Ingest HuggingFace real-estate listings into the shared listings store."""
+    if reset:
+        store.reset_collection("listings")
+
+    stats = IngestStats(source="hf-listings")
+    try:
+        path = _ensure_hf_cache(
+            dataset_name=dataset_name,
+            split=split,
+            cache_path=cache_path,
+            refresh=refresh_cache,
+            limit=limit,
+        )
+    except Exception as exc:
+        stats.errors += 1
+        log.error("Failed to prepare HuggingFace dataset %s: %s", dataset_name, exc)
+        tqdm.write(f"  ⚠ HuggingFace dataset skipped: {exc}")
+        return stats
+
+    total = _count_jsonl(path)
+    if limit is not None:
+        total = min(total, limit)
+    stats.total = total
+
+    ids, docs, metas, recs = [], [], [], []
+
+    with tqdm(
+        total=total,
+        desc="HF Listings",
+        unit="rec",
+        colour="cyan",
+        dynamic_ncols=True,
+    ) as pbar:
+        for idx, raw in enumerate(_stream_jsonl(path)):
+            if limit is not None and idx >= limit:
+                break
+            pbar.update(1)
+
+            try:
+                row_index = int(raw.get("_hf_row_index", idx))
+                record = normalize_hf_listing(raw, row_index=row_index, dataset_name=dataset_name)
+                url = record.get("url")
+                if not url:
+                    stats.skipped += 1
+                    continue
+
+                source_id = _make_id("hf_listing_record", url)
+                record["id"] = source_id
+                chunks = listing_to_chunks(record)
+                base_meta = normalize_listing_metadata(record)
+                base_meta.update(
+                    {
+                        "source_dataset": dataset_name,
+                        "external_source_record_id": str(record.get("source_record_id") or ""),
+                        "external_source": "huggingface",
+                    }
+                )
+
+                if not chunks:
+                    stats.skipped += 1
+                    continue
+
+                for chunk in chunks:
+                    chunk_idx = int(chunk["chunk_index"])
+                    ids.append(_make_id("hf_listing", url, chunk_idx))
+                    docs.append(chunk["text"])
+                    metas.append(
+                        {
+                            **base_meta,
+                            "source_record_id": source_id,
+                            "chunk_type": chunk["chunk_type"],
+                            "chunk_index": chunk_idx,
+                            "total_chunks": chunk["total_chunks"],
+                        }
+                    )
+                    recs.append(record)
+                    stats.chunks += 1
+
+                stats.ingested += 1
+
+                if len(ids) >= batch_size:
+                    _flush(store, "listings", ids, docs, metas, recs, batch_size)
+                    ids, docs, metas, recs = [], [], [], []
+
+            except Exception as e:
+                stats.errors += 1
+                log.debug("HF listing error row=%s: %s", idx, e)
+
+            pbar.set_postfix(ok=stats.ingested, skip=stats.skipped, err=stats.errors)
+
+        _flush(store, "listings", ids, docs, metas, recs, batch_size)
+
+    try:
+        tqdm.write("  ↻ Refreshing market_snapshots...")
+        store.pg.refresh_market_snapshots()
+    except Exception as e:
+        tqdm.write(f"  ⚠ refresh_market_snapshots failed: {e}")
+
+    tqdm.write(stats.summary())
+    return stats
 
 def ingest_projects(
     store: VectorStore,
@@ -277,19 +628,31 @@ def ingest_projects(
                 continue
 
             try:
-                doc_id = _make_id("project", url)
-                record["id"] = doc_id
-                text = project_to_text(record)
-                meta = normalize_project_metadata(record)
+                source_id = _make_id("project_record", url)
+                record["id"] = source_id
+                chunks = project_to_chunks(record)
+                base_meta = normalize_project_metadata(record)
 
-                if not text.strip():
+                if not chunks:
                     stats.skipped += 1
                     continue
 
-                ids.append(doc_id)
-                docs.append(text)
-                metas.append(meta)
-                recs.append(record)
+                for chunk in chunks:
+                    chunk_idx = int(chunk["chunk_index"])
+                    ids.append(_make_id("project", url, chunk_idx))
+                    docs.append(chunk["text"])
+                    metas.append(
+                        {
+                            **base_meta,
+                            "source_record_id": source_id,
+                            "chunk_type": chunk["chunk_type"],
+                            "chunk_index": chunk_idx,
+                            "total_chunks": chunk["total_chunks"],
+                        }
+                    )
+                    recs.append(record)
+                    stats.chunks += 1
+
                 stats.ingested += 1
 
                 if len(ids) >= batch_size:
@@ -352,22 +715,28 @@ def ingest_articles(
                 seen_urls.add(url)
 
                 try:
+                    source_id = _make_id("article_record", url)
+                    record["id"] = source_id
                     base_meta = normalize_article_metadata(record)
                     chunks = article_to_chunks(record)
 
-                    for chunk_text, chunk_idx, total_chunks in chunks:
+                    for chunk in chunks:
+                        chunk_text = chunk["text"]
                         if not chunk_text.strip():
                             continue
+                        chunk_idx = int(chunk["chunk_index"])
                         doc_id = _make_id("article", url, chunk_idx)
                         meta = {
                             **base_meta,
+                            "source_record_id": source_id,
+                            "chunk_type": chunk["chunk_type"],
                             "chunk_index": chunk_idx,
-                            "total_chunks": total_chunks,
+                            "total_chunks": chunk["total_chunks"],
                         }
                         ids.append(doc_id)
                         docs.append(chunk_text)
                         metas.append(meta)
-                        recs.append({**record, "id": doc_id})
+                        recs.append(record)
                         stats.chunks += 1
 
                     stats.ingested += 1
@@ -435,35 +804,43 @@ def ingest_social(
                     continue
 
                 try:
-                    doc_id = _make_id(source_type, url)
-                    record["id"] = doc_id
-                    text = social_to_text(record)
-
-                    if not text.strip():
-                        stats.skipped += 1
-                        continue
-
                     stats_raw = record.get("stats") or {}
                     relevance = _social_relevance_score(record)
                     record["relevance_score"] = relevance
+                    source_id = _make_id(f"{source_type}_record", url)
+                    record["id"] = source_id
+                    chunks = social_to_chunks(record)
 
-                    meta = {
+                    if not chunks:
+                        stats.skipped += 1
+                        continue
+
+                    base_meta = {
                         "source_type": source_type,
+                        "source_record_id": source_id,
                         "keyword": record.get("keyword") or "",
-                        "stats_views": int(
-                            stats_raw.get("views") or stats_raw.get("view_count") or 0
-                        ),
-                        "stats_likes": int(
-                            stats_raw.get("likes") or stats_raw.get("like_count") or 0
-                        ),
-                        "reactions": int(record.get("reactions") or 0),
+                        "url": url,
+                        "stats_views": _safe_int(stats_raw.get("views") or stats_raw.get("view_count")),
+                        "stats_likes": _safe_int(stats_raw.get("likes") or stats_raw.get("like_count")),
+                        "reactions": _safe_int(record.get("reactions")),
                         "relevance_score": relevance,
                     }
 
-                    ids.append(doc_id)
-                    docs.append(text)
-                    metas.append(meta)
-                    recs.append(record)
+                    for chunk in chunks:
+                        chunk_idx = int(chunk["chunk_index"])
+                        ids.append(_make_id(source_type, url, chunk_idx))
+                        docs.append(chunk["text"])
+                        metas.append(
+                            {
+                                **base_meta,
+                                "chunk_type": chunk["chunk_type"],
+                                "chunk_index": chunk_idx,
+                                "total_chunks": chunk["total_chunks"],
+                            }
+                        )
+                        recs.append(record)
+                        stats.chunks += 1
+
                     stats.ingested += 1
 
                     if len(ids) >= batch_size:
@@ -498,6 +875,9 @@ def ingest_pois(
     path = DATA_DIR / "pois.json"
     stats = IngestStats(source="pois")
     stats.total = _count_records(path)
+    if not path.exists():
+        tqdm.write(f"  ⏭ POIs skipped: {path} not found")
+        return stats
 
     with tqdm(
         total=stats.total,

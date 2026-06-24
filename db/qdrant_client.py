@@ -3,22 +3,25 @@ from typing import Any, Dict, List, Optional
 from qdrant_client import QdrantClient as RealQdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, Range
 
+from db.config import EMBEDDING_DIM, QDRANT_DISTANCE
+
 log = logging.getLogger("bds_database.qdrant")
 
 class QdrantClientWrapper:
     """Manages high-performance Qdrant vector database collections and similarity searches."""
     
-    def __init__(self, host: str = "localhost", port: int = 6333, vector_dim: int = 384):
+    def __init__(self, host: str = "localhost", port: int = 6333, vector_dim: int = EMBEDDING_DIM):
         self.host = host
         self.port = port
         self.vector_dim = vector_dim
+        self.distance = getattr(Distance, QDRANT_DISTANCE.upper(), Distance.DOT)
         
         log.info(f"Initializing Qdrant client at http://{self.host}:{self.port}")
         self.client = RealQdrantClient(url=f"http://{self.host}:{self.port}", check_compatibility=False)
         self.init_collections()
 
     def init_collections(self):
-        """Ensure listings, projects, articles, and social_neighborhood collections exist with cosine indices."""
+        """Ensure listings, projects, articles, and social_neighborhood collections exist."""
         collections = ["listings", "projects", "articles", "social_neighborhood"]
 
         
@@ -29,7 +32,7 @@ class QdrantClientWrapper:
                     log.info(f"Creating Qdrant collection: '{c}'")
                     self.client.create_collection(
                         collection_name=c,
-                        vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE),
+                        vectors_config=VectorParams(size=self.vector_dim, distance=self.distance),
                     )
             log.info("Qdrant collections verified/initialized successfully.")
         except Exception as e:
@@ -42,7 +45,7 @@ class QdrantClientWrapper:
             self.client.delete_collection(collection_name=collection_name)
             self.client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=self.vector_dim, distance=self.distance),
             )
             log.info(f"Reset Qdrant collection '{collection_name}' successfully.")
         except Exception as e:
@@ -64,7 +67,7 @@ class QdrantClientWrapper:
             ids: unique hashes
             documents: original raw text representation
             metadatas: payload fields
-            embeddings: 384-dimensional dense vectors
+            embeddings: dense vectors matching db.config.EMBEDDING_DIM
         """
         points = []
         for i in range(len(ids)):

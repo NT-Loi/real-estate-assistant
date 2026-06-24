@@ -20,7 +20,7 @@ The assistant implements a multi-layered **Agentic RAG pipeline** driven by a **
 
 ### 🛠️ Technology Stack
 - **AI Agent Framework:** ReAct loop implemented in Python, integrated with local LLMs (via Ollama Qwen2.5) or Google Gemini API.
-- **Data & Embedding Layer:** PostgreSQL (structured metadata & market aggregations) and Qdrant (dense vectors with `paraphrase-multilingual-MiniLM-L12-v2`).
+- **Data & Embedding Layer:** PostgreSQL (structured metadata & market aggregations) and Qdrant (dense vectors with `AITeamVN/Vietnamese_Embedding_v2`, 1024 dimensions).
 - **Web App & UI:** FastAPI (backend with SSE streaming) and React + Vite (frontend interactive dashboard).
 
 ---

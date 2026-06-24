@@ -469,7 +469,7 @@ def get_listing_pois(listing_id: str):
         
     # Generate the DB ID using uuid.uuid5
     try:
-        raw_key = f"listing:{url}:0"
+        raw_key = f"listing_record:{url}:0"
         db_id = str(uuid.uuid5(uuid.NAMESPACE_URL, raw_key))
     except Exception as e:
         return {"pois": [], "error": f"Failed to generate DB ID: {e}"}

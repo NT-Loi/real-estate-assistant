@@ -146,6 +146,10 @@ class ProjectCrawler(BaseCrawler):
                     const txt = nameEl.innerText.trim();
                     if (txt && txt !== 'batdongsan.com.vn') d.ten_du_an = txt;
                 }
+                if (!d.ten_du_an && document.title) {
+                    const title = document.title.replace(/^Dự án\\s+/i, '').split('|')[0].trim();
+                    if (title) d.ten_du_an = title;
+                }
 
                 // Project Status
                 const statusEl = document.querySelector('.re__prj-tag-info');
@@ -187,6 +191,21 @@ class ProjectCrawler(BaseCrawler):
                     '.js__prj-detail-content, .re__project-editor, .re__detail-content, .re__project-desc'
                 );
                 if (descEl) d._mo_ta_chi_tiet = descEl.innerText.trim().substring(0, 15000);
+                if (!d._mo_ta_chi_tiet) {
+                    const metaDesc = document.querySelector('meta[property="og:description"], meta[name="description"]');
+                    const metaText = metaDesc ? (metaDesc.getAttribute('content') || '').trim() : '';
+                    if (metaText && metaText.length > 30) d._mo_ta_chi_tiet = metaText.substring(0, 15000);
+                }
+                if (!d._mo_ta_chi_tiet) {
+                    const mainEl = document.querySelector('main, article, body');
+                    const rawText = mainEl ? mainEl.innerText.trim() : '';
+                    const cleaned = rawText
+                        .split('\\n')
+                        .map(line => line.trim())
+                        .filter(line => line && !/^(Đăng nhập|Đăng ký|Tải ứng dụng|Mua bán|Cho thuê|Tin tức|Wiki BĐS)$/i.test(line))
+                        .join('\\n');
+                    if (cleaned.length > 120) d._mo_ta_chi_tiet = cleaned.substring(0, 15000);
+                }
 
                 // Section-based extraction: try to capture 'Thông tin chi tiết' and 'Tiện ích' content
                 try {
@@ -207,6 +226,11 @@ class ProjectCrawler(BaseCrawler):
                 // Full address
                 const addrEl = document.querySelector('.re__project-address, .re__pr-short-description--address');
                 if (addrEl) d._dia_chi = addrEl.innerText.trim();
+                if (!d._dia_chi) {
+                    const metaAddr = document.querySelector('meta[property="og:street-address"], meta[name="address"], meta[property="og:address"]');
+                    const metaAddrText = metaAddr ? (metaAddr.getAttribute('content') || '').trim() : '';
+                    if (metaAddrText) d._dia_chi = metaAddrText;
+                }
 
                 // Project galleries
                 const imgs = [];

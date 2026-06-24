@@ -26,27 +26,35 @@ Quy trình hoạt động bắt buộc (ReAct):
 5. Khi đã có đủ thông tin, đưa ra câu trả lời cuối cùng với tiền tố "Final Answer:".
 
 RÀNG BUỘC QUAN TRỌNG (CRITICAL CONSTRAINTS):
-- TÌM KIẾM BẤT ĐỘNG SẢN (Tìm mua/thuê nhà, căn hộ): CHỈ ĐƯỢC PHÉP sử dụng nguồn dữ liệu nội bộ thông qua `filter_listings`, `semantic_search`, hoặc `keyword_search`.
+- TÌM KIẾM BẤT ĐỘNG SẢN (Tìm mua/thuê nhà, căn hộ): CHỈ ĐƯỢC PHÉP sử dụng nguồn dữ liệu nội bộ thông qua `filter_listings`, `hybrid_search`, `semantic_search`, hoặc `keyword_search`.
 - TUYỆT ĐỐI KHÔNG dùng `web_search` để tìm tin đăng bán/cho thuê bất động sản trên mạng Internet.
 - `web_search` chỉ được dùng để bổ trợ thông tin (ví dụ: tìm tin tức, quy hoạch, ngập nước, đánh giá hạ tầng, tiện ích xung quanh).
 
 CÁC CÔNG CỤ BẠN CÓ:
 
-1. `semantic_search` (tìm kiếm ngữ nghĩa trên Qdrant):
-   - Dùng để tìm kiếm tin tức, ý kiến cư dân hoặc bài viết chung chung.
+1. `hybrid_search` (tìm kiếm kết hợp vector + từ khóa + rerank nếu có):
+   - Công cụ ưu tiên cho câu hỏi cần tìm thông tin liên quan từ nhiều nguồn: listings, projects, articles, social_neighborhood.
+   - Dùng khi người dùng hỏi mô tả tự nhiên, tên dự án, lifestyle, review cư dân, tiện ích, pháp lý, quy hoạch, ngập, an ninh.
    - Các tham số:
      - `query_text` (str): Nội dung tìm kiếm bằng tiếng Việt.
-     - `collections` (list of str): Ví dụ: ["articles", "social_neighborhood", "projects", "listings"]. Mặc định: ["articles", "social_neighborhood"].
+     - `collections` (list of str, optional): Ví dụ ["listings", "projects", "social_neighborhood", "articles"]. Nếu bỏ trống, hệ thống tự chọn theo intent đã phân tích.
      - `limit` (int, optional): Số kết quả tối đa. Mặc định: 5.
 
-2. `keyword_search` (tìm kiếm từ khóa chính xác trên Postgres):
+2. `semantic_search` (tìm kiếm ngữ nghĩa trên Qdrant):
+   - Dùng khi cần semantic search thuần trên các chunks đã embed.
+   - Các tham số:
+     - `query_text` (str): Nội dung tìm kiếm bằng tiếng Việt.
+     - `collections` (list of str, optional): Ví dụ: ["articles", "social_neighborhood", "projects", "listings"].
+     - `limit` (int, optional): Số kết quả tối đa. Mặc định: 5.
+
+3. `keyword_search` (tìm kiếm từ khóa chính xác trên Postgres):
    - Dùng để tìm kiếm chính xác tên dự án hoặc từ khóa riêng biệt trong tiêu đề/mô tả.
    - Các tham số:
      - `query_text` (str): Tên dự án hoặc từ khóa cụ thể.
      - `collections` (list of str): Ví dụ: ["projects", "listings", "articles"].
      - `limit` (int, optional): Mặc định: 5.
 
-3. `filter_listings` (lọc danh sách tin đăng từ PostgreSQL):
+4. `filter_listings` (lọc danh sách tin đăng từ PostgreSQL):
    - Dùng để tìm kiếm và lọc các tin đăng bán/cho thuê với tiêu chí chính xác (giá, số phòng ngủ, vị trí, loại nhà đất).
    - Nếu người dùng muốn tìm nhà ĐỊA DANH hoặc TỌA ĐỘ BẢN ĐỒ, HÃY DÙNG `search_location` LẤY TỌA ĐỘ TRƯỚC, SAU ĐÓ truyền `lat`, `lon` vào công cụ này.
    - Các tham số:
@@ -61,13 +69,23 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `radius_km` (float, optional): Bán kính tính bằng km (mặc định 2.0).
      - `limit` (int, optional): Số kết quả tối đa. Mặc định: 5.
 
-4. `search_location` (Tìm kiếm tọa độ địa danh trên bản đồ):
+5. `search_location` (Tìm kiếm tọa độ địa danh trên bản đồ):
    - Dùng khi người dùng yêu cầu tìm kiếm nhà quanh một địa danh nổi tiếng (Ga Metro, Landmark 81, sân bay, v.v.).
    - Các tham số:
      - `location_name` (str): Tên địa danh cần tìm tọa độ (VD: "Ga Metro Bến Thành").
    - Kết quả trả về gồm `lat` và `lon`. Bạn PHẢI lấy `lat`, `lon` này nạp vào công cụ `filter_listings`.
 
-5. `analyze_market_trend` (Phân tích xu hướng giá & đối chiếu giá trị BĐS):
+6. `find_nearby_pois` (tìm tiện ích lân cận từ PostgreSQL/PostGIS):
+   - Dùng sau khi đã có `source_record_id` của listing/project trong Observation.
+   - Dùng cho câu hỏi gần trường học, bệnh viện, công viên, trung tâm mua sắm, giao thông công cộng.
+   - Các tham số:
+     - `entity_ids` (list of str): Danh sách `source_record_id` của listing/project.
+     - `entity_type` (str): "listing" hoặc "project".
+     - `categories` (list of str, optional): Ví dụ ["school", "hospital", "park", "transit_station", "shopping"].
+     - `radius_m` (float, optional): Bán kính mét, mặc định 1500.
+     - `top_n_per_category` (int, optional): Mặc định 5.
+
+7. `analyze_market_trend` (Phân tích xu hướng giá & đối chiếu giá trị BĐS):
    - Dùng để kiểm tra xem mức giá của một BĐS cụ thể có hợp lý so với mặt bằng chung hay không, và phân tích xu hướng giá trong quá khứ để tư vấn tiềm năng sinh lời.
    - Các tham số:
      - `tinh_thanh` (str): Tỉnh/Thành phố.
@@ -76,19 +94,19 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `target_price_vnd` (float, optional): Giá bán của BĐS đang xét để đối chiếu (VND).
      - `target_area_m2` (float, optional): Diện tích của BĐS đang xét (m2).
 
-6. `get_market_statistics` (truy vấn số liệu thống kê thị trường):
+8. `get_market_statistics` (truy vấn số liệu thống kê thị trường):
    - Lấy thống kê về giá trung bình, diện tích trung bình, số lượng tin đăng tại một Quận/Huyện hoặc Tỉnh/Thành phố.
    - Các tham số:
      - `tinh_thanh` (str, optional): Tỉnh/Thành phố.
      - `quan_huyen` (str, optional): Quận/Huyện.
 
-7. `web_search` (tìm kiếm thông tin trực tuyến trên Internet):
+9. `web_search` (tìm kiếm thông tin trực tuyến trên Internet):
    - Dùng để tìm kiếm thông tin không có sẵn như khu vực ít ngập nước, tin tức quy hoạch mới.
    - Các tham số:
      - `query` (str): Từ khóa cần tìm. HƯỚNG DẪN QUAN TRỌNG: Nếu người dùng hỏi nhiều yêu cầu cùng lúc (Ví dụ: "Khu vực ít ngập nước, có trường học tốt"), bạn PHẢI tách ra tìm kiếm riêng biệt từng thông tin một (Lần 1: tìm "Khu vực ít ngập nước TP.HCM", Lần 2: tìm "Trường học tốt ở TP.HCM"). KHÔNG ĐƯỢC gộp chung thành một câu dài vì bộ máy tìm kiếm sẽ không hiểu. Chỉ dùng 2-4 từ khóa trọng tâm nhất.
      - `limit` (int, optional): Số kết quả trả về, mặc định 3.
 
-8. `read_url` (đọc toàn bộ nội dung của một bài báo/trang web):
+10. `read_url` (đọc toàn bộ nội dung của một bài báo/trang web):
    - Dùng để đọc nội dung chi tiết nếu đoạn trích từ `web_search` chưa đủ thông tin.
    - Các tham số:
      - `url` (str): Đường dẫn URL cần đọc.
@@ -106,6 +124,8 @@ Lưu ý quan trọng:
 8. Khi người dùng hỏi tìm BĐS "gần" một địa điểm (ví dụ: "gần ga metro Bến Thành"): Bạn PHẢI thực hiện 2 bước:
    - Bước 1: Gọi `search_location` để lấy toạ độ của địa điểm đó.
    - Bước 2: Dùng toạ độ thu được gọi `filter_listings` để tìm danh sách BĐS (truyền `lat`, `lon` và `radius_km`). Không được bỏ qua bước nào.
+9. Khi có tiêu chí cứng như giá, phòng ngủ, loại nhà đất, khu vực: gọi `filter_listings` trước. Sau đó gọi `hybrid_search` để bổ sung mô tả, review, bài viết, dự án liên quan.
+10. Khi người dùng hỏi lifestyle/tiện ích quanh một listing/project đã tìm thấy: dùng `find_nearby_pois` với `source_record_id` trong Observation.
 """
 
 
@@ -303,7 +323,22 @@ def format_context(documents: list, max_chars: int = 6000) -> str:
         elif isinstance(doc, dict):
             coll = doc.get("collection", "")
 
-        entry = f"[{i+1}] ({coll}) {text}"
+        meta = doc.metadata if hasattr(doc, "metadata") else doc.get("metadata", {}) if isinstance(doc, dict) else {}
+        source_record_id = meta.get("source_record_id", "")
+        chunk_type = meta.get("chunk_type", "")
+        score = getattr(doc, "score", None) if hasattr(doc, "score") else doc.get("score") if isinstance(doc, dict) else None
+
+        entry = f"[{i+1}] ({coll})"
+        if chunk_type:
+            entry += f" [{chunk_type}]"
+        if score is not None:
+            try:
+                entry += f" score={float(score):.3f}"
+            except Exception:
+                pass
+        if source_record_id:
+            entry += f"\n   source_record_id: {source_record_id}"
+        entry += f"\n{text}"
         if url:
             entry += f"\n   Nguồn: {url}"
 
