@@ -10,6 +10,7 @@ __pycache__
 *.pptx
 
 data
+data-Loi
 docs
 db_data
 
