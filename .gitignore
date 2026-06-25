@@ -13,6 +13,7 @@ data
 data-Loi
 docs
 db_data
+bds_embeddings
 
 *.zip
 cookies_bds.txt

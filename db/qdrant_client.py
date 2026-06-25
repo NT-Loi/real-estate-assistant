@@ -1,23 +1,63 @@
 import logging
 from typing import Any, Dict, List, Optional
 from qdrant_client import QdrantClient as RealQdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, Range
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    Fusion,
+    FusionQuery,
+    MatchValue,
+    Modifier,
+    PointStruct,
+    Prefetch,
+    Range,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
 
-from db.config import EMBEDDING_DIM, QDRANT_DISTANCE
+from db.config import (
+    EMBEDDING_DIM,
+    QDRANT_API_KEY,
+    QDRANT_DISTANCE,
+    QDRANT_HOST,
+    QDRANT_PORT,
+    QDRANT_URL,
+)
+from db.sparse_encoder import encode_sparse, sparse_doc_len
 
 log = logging.getLogger("bds_database.qdrant")
+
+DENSE_VECTOR_NAME = "dense"
+SPARSE_VECTOR_NAME = "text-sparse"
 
 class QdrantClientWrapper:
     """Manages high-performance Qdrant vector database collections and similarity searches."""
     
-    def __init__(self, host: str = "localhost", port: int = 6333, vector_dim: int = EMBEDDING_DIM):
+    def __init__(
+        self,
+        host: str = QDRANT_HOST,
+        port: int = QDRANT_PORT,
+        vector_dim: int = EMBEDDING_DIM,
+        url: str = QDRANT_URL,
+        api_key: str = QDRANT_API_KEY,
+    ):
         self.host = host
         self.port = port
+        self.url = url
+        self.api_key = api_key or None
         self.vector_dim = vector_dim
         self.distance = getattr(Distance, QDRANT_DISTANCE.upper(), Distance.DOT)
-        
-        log.info(f"Initializing Qdrant client at http://{self.host}:{self.port}")
-        self.client = RealQdrantClient(url=f"http://{self.host}:{self.port}", check_compatibility=False)
+
+        endpoint = self.url or f"http://{self.host}:{self.port}"
+        log.info(f"Initializing Qdrant client at {endpoint}")
+        self.client = RealQdrantClient(
+            url=endpoint,
+            api_key=self.api_key,
+            timeout=120,
+            check_compatibility=False,
+        )
         self.init_collections()
 
     def init_collections(self):
@@ -30,23 +70,28 @@ class QdrantClientWrapper:
             for c in collections:
                 if c not in existing_colls:
                     log.info(f"Creating Qdrant collection: '{c}'")
-                    self.client.create_collection(
-                        collection_name=c,
-                        vectors_config=VectorParams(size=self.vector_dim, distance=self.distance),
-                    )
+                    self._create_collection(c)
             log.info("Qdrant collections verified/initialized successfully.")
         except Exception as e:
             log.error(f"Failed to connect or initialize Qdrant: {e}")
             raise e
 
+    def _create_collection(self, collection_name: str):
+        self.client.create_collection(
+            collection_name=collection_name,
+            vectors_config={
+                DENSE_VECTOR_NAME: VectorParams(size=self.vector_dim, distance=self.distance),
+            },
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF),
+            },
+        )
+
     def reset_collection(self, collection_name: str):
         """Recreate and drop a collection."""
         try:
             self.client.delete_collection(collection_name=collection_name)
-            self.client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(size=self.vector_dim, distance=self.distance),
-            )
+            self._create_collection(collection_name)
             log.info(f"Reset Qdrant collection '{collection_name}' successfully.")
         except Exception as e:
             log.warning(f"Error resetting collection {collection_name}: {e}")
@@ -70,6 +115,8 @@ class QdrantClientWrapper:
             embeddings: dense vectors matching db.config.EMBEDDING_DIM
         """
         points = []
+        doc_lengths = [sparse_doc_len(doc) for doc in documents]
+        avg_doc_len = sum(doc_lengths) / len(doc_lengths) if doc_lengths else 1.0
         for i in range(len(ids)):
             # Combine the original text document inside the payload
             payload = {**metadatas[i], "document_text": documents[i]}
@@ -81,7 +128,13 @@ class QdrantClientWrapper:
             points.append(
                 PointStruct(
                     id=ids[i],
-                    vector=embeddings[i],
+                    vector={
+                        DENSE_VECTOR_NAME: embeddings[i],
+                        SPARSE_VECTOR_NAME: encode_sparse(
+                            documents[i],
+                            avg_doc_len=avg_doc_len,
+                        ),
+                    },
                     payload=payload
                 )
             )
@@ -166,6 +219,7 @@ class QdrantClientWrapper:
             response = self.client.query_points(
                 collection_name=collection_name,
                 query=query_vector,
+                using=DENSE_VECTOR_NAME,
                 query_filter=qdrant_filter,
                 limit=n_results,
                 with_payload=True,
@@ -183,6 +237,66 @@ class QdrantClientWrapper:
         except Exception as e:
             log.warning(f"Qdrant search failed on collection '{collection_name}': {e}")
             return []
+
+        output = []
+        for hit in hits:
+            payload = dict(hit.payload or {})
+            doc = payload.pop("document_text", "")
+            output.append({
+                "id": hit.id,
+                "document": doc,
+                "metadata": payload,
+                "score": hit.score,
+            })
+        return output
+
+    def hybrid_search(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        query_text: str,
+        n_results: int = 10,
+        payload_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run Qdrant dense+sparse hybrid search using reciprocal-rank fusion."""
+        qdrant_filter = self._build_filter(payload_filter)
+        sparse_query = encode_sparse(query_text, is_query=True)
+        prefetch_limit = max(n_results * 4, n_results)
+
+        try:
+            response = self.client.query_points(
+                collection_name=collection_name,
+                prefetch=[
+                    Prefetch(
+                        query=query_vector,
+                        using=DENSE_VECTOR_NAME,
+                        filter=qdrant_filter,
+                        limit=prefetch_limit,
+                    ),
+                    Prefetch(
+                        query=sparse_query,
+                        using=SPARSE_VECTOR_NAME,
+                        filter=qdrant_filter,
+                        limit=prefetch_limit,
+                    ),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=n_results,
+                with_payload=True,
+            )
+            hits = response.points
+        except Exception as e:
+            log.warning(
+                "Qdrant hybrid search failed on collection '%s'; falling back to dense search: %s",
+                collection_name,
+                e,
+            )
+            return self.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                n_results=n_results,
+                payload_filter=payload_filter,
+            )
 
         output = []
         for hit in hits:

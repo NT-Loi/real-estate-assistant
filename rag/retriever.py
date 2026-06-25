@@ -118,8 +118,17 @@ class Retriever:
         all_docs.sort(key=lambda d: d.score, reverse=True)
         all_docs = self._deduplicate(all_docs)
         if self._reranker and all_docs:
-            all_docs = self._reranker.rerank(query_text, all_docs[:RERANKER_CANDIDATES], top_k)
-        result = all_docs[:top_k]
+            rerank_keep = min(
+                len(all_docs),
+                max(top_k * 4, top_k),
+                RERANKER_CANDIDATES,
+            )
+            all_docs = self._reranker.rerank(
+                query_text,
+                all_docs[:RERANKER_CANDIDATES],
+                rerank_keep,
+            )
+        result = self._collapse_by_source(all_docs, top_k=top_k)
 
         return result
 
@@ -132,25 +141,45 @@ class Retriever:
         per_collection_k: int = 20,
         lifestyle_signals: Optional[list[str]] = None,
     ) -> list[RetrievedDocument]:
-        """Combine dense Qdrant candidates with PostgreSQL keyword candidates."""
-        dense_docs = self.retrieve(
-            query_text=query_text,
-            collections=collections,
-            filters=filters,
-            top_k=RERANKER_CANDIDATES,
-            per_collection_k=per_collection_k,
-            lifestyle_signals=lifestyle_signals,
-        )
+        """Combine Qdrant dense+sparse hybrid candidates with SQL keyword fallback."""
+        hybrid_docs: list[RetrievedDocument] = []
+        if not collections:
+            collections = ["articles", "social_neighborhood"]
+
+        for coll_name in collections:
+            try:
+                hybrid_docs.extend(
+                    self._search_collection(
+                        coll_name,
+                        query_text,
+                        filters,
+                        per_collection_k,
+                        hybrid=True,
+                    )
+                )
+            except Exception as e:
+                log.warning(f"Hybrid search failed on '{coll_name}': {e}")
+
         keyword_docs = self.keyword_retrieve(
             query_text=query_text,
             collections=collections,
-            top_k=RERANKER_CANDIDATES,
+            top_k=max(10, per_collection_k),
         )
-        merged = self._merge_candidates(dense_docs + keyword_docs)
+        merged = self._merge_candidates(hybrid_docs + keyword_docs)
         if self._reranker and merged:
-            return self._reranker.rerank(query_text, merged[:RERANKER_CANDIDATES], top_k)
+            rerank_keep = min(
+                len(merged),
+                max(top_k * 4, top_k),
+                RERANKER_CANDIDATES,
+            )
+            reranked = self._reranker.rerank(
+                query_text,
+                merged[:RERANKER_CANDIDATES],
+                rerank_keep,
+            )
+            return self._collapse_by_source(reranked, top_k=top_k)
         merged.sort(key=lambda d: d.score, reverse=True)
-        return merged[:top_k]
+        return self._collapse_by_source(merged, top_k=top_k)
 
     def keyword_retrieve(
         self,
@@ -276,6 +305,7 @@ class Retriever:
         query_text: str,
         filters: Optional[dict],
         n_results: int,
+        hybrid: bool = False,
     ) -> list[RetrievedDocument]:
         """Search a single collection and return RetrievedDocument list."""
         # Build Qdrant filter condition from filters
@@ -287,6 +317,7 @@ class Retriever:
                 query=query_text,
                 n_results=n_results,
                 where=where,
+                hybrid=hybrid,
             )
         except Exception as e:
             # If filter causes error, retry without
@@ -299,6 +330,7 @@ class Retriever:
                     collection_name=collection_name,
                     query=query_text,
                     n_results=n_results,
+                    hybrid=hybrid,
                 )
             else:
                 raise
@@ -427,6 +459,11 @@ class Retriever:
                     continue
                 conditions.append({key: {"$eq": value}})
 
+            elif key == "loai_hinh":
+                if collection_name != "listings":
+                    continue
+                conditions.append({key: {"$eq": value}})
+
         if collection_name == "social_neighborhood":
             conditions.append({"relevance_score": {"$gte": 0.15}})
 
@@ -471,6 +508,45 @@ class Retriever:
         merged = list(best.values())
         merged.sort(key=lambda d: d.score, reverse=True)
         return merged
+
+    def _collapse_by_source(
+        self,
+        docs: list[RetrievedDocument],
+        top_k: Optional[int] = None,
+    ) -> list[RetrievedDocument]:
+        """Keep the best final chunk per underlying source record.
+
+        Chunk-level retrieval is still useful for matching/reranking, but final
+        LLM context should favor diverse listings/projects/articles over several
+        chunks from the same row.
+        """
+        best: dict[tuple[str, str], RetrievedDocument] = {}
+        order: list[tuple[str, str]] = []
+
+        for doc in docs:
+            key = self._source_key(doc)
+            current = best.get(key)
+            if current is None:
+                best[key] = doc
+                order.append(key)
+            elif doc.score > current.score:
+                best[key] = doc
+
+        collapsed = [best[key] for key in order]
+        collapsed.sort(key=lambda d: d.score, reverse=True)
+        return collapsed[:top_k] if top_k is not None else collapsed
+
+    def _source_key(self, doc: RetrievedDocument) -> tuple[str, str]:
+        meta = doc.metadata or {}
+        record = doc.record or {}
+        source_id = (
+            meta.get("source_record_id")
+            or record.get("id")
+            or meta.get("url")
+            or record.get("url")
+            or doc.text[:160].strip()
+        )
+        return (doc.collection, str(source_id))
 
     def _decode_record(self, raw):
         import json

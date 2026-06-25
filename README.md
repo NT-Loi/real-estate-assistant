@@ -40,9 +40,9 @@ REQUEST_DELAY=1.0
 # LLM Provider selection: "vertexai", "gemini", or "ollama"
 LLM_PROVIDER=vertexai
 
-# Chat model (optional, default: gemini-2.5-flash-lite)
+# Chat model (optional, default: gemini-2.5-flash)
 PROJECT_ID=your_gcp_project_id
-GEMINI_MODEL=gemini-2.5-flash-lite
+GEMINI_MODEL=gemini-2.5-flash
 # GEMINI_API_KEY=your_gemini_key (If LLM_PROVIDER=gemini)
 
 # If using Ollama:

@@ -106,6 +106,7 @@ class VectorStore:
         query: str,
         n_results: int = 10,
         where: Optional[dict] = None,
+        hybrid: bool = False,
     ) -> dict:
         """
         Semantic search backed by high-performance Qdrant similarity search.
@@ -128,12 +129,21 @@ class VectorStore:
         raw = self._embedder.embed(query)
         # embed() always returns list-of-lists; unwrap to flat vector for single query
         query_vector = raw[0] if raw and isinstance(raw[0], list) else raw
-        hits = self.qdrant.search(
-            collection_name=collection_name,
-            query_vector=query_vector,
-            n_results=n_results,
-            payload_filter=where
-        )
+        if hybrid:
+            hits = self.qdrant.hybrid_search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                query_text=query,
+                n_results=n_results,
+                payload_filter=where,
+            )
+        else:
+            hits = self.qdrant.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                n_results=n_results,
+                payload_filter=where,
+            )
         
         # Convert Qdrant format to match the ChromaDB client expectation for backward compatibility
         res = {

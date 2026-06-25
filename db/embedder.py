@@ -7,6 +7,7 @@ Uses the model specified in db.config.EMBEDDING_MODEL.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Union
 
 from sentence_transformers import SentenceTransformer
@@ -26,6 +27,8 @@ class Embedder:
     def _load(self) -> SentenceTransformer:
         if self._model is None:
             log.info(f"Loading embedding model: {self._model_name}")
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+            hf_token = os.getenv("HF_TOKEN") or None
             try:
                 # Try loading from local cache first — no network calls
                 self._model = SentenceTransformer(
@@ -36,7 +39,7 @@ class Embedder:
             except Exception:
                 # Cache miss — download from HuggingFace (first run only)
                 log.info("Model not cached yet — downloading from HuggingFace…")
-                self._model = SentenceTransformer(self._model_name)
+                self._model = SentenceTransformer(self._model_name, token=hf_token)
                 log.info("Embedding model downloaded and cached")
 
             dim = self._model.get_embedding_dimension()

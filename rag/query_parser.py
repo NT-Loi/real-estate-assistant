@@ -11,12 +11,18 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
 
 from db.normalizer import parse_price, CITY_ALIASES
 
 log = logging.getLogger("bds_query_parser")
+
+
+def _strip_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +87,8 @@ filters keys (only include if clearly mentioned):
 - so_phong_ngu: integer number of bedrooms
 - tinh_thanh: city/province name in Vietnamese
 - quan_huyen: district name
-- loai_nha_dat: "Can ho chung cu" | "Nha rieng" | "Dat" | "Biet thu" | "Shophouse"
+- loai_nha_dat: "Căn hộ chung cư" | "Nhà riêng" | "Đất" | "Nhà biệt thự, liền kề" | "Shophouse"
+- loai_hinh: "ban" for buying/sale queries, "cho_thue" for rental queries
 
 Rules: output ONLY the JSON object. No markdown. No explanation.\
 """
@@ -154,7 +161,7 @@ def _llm_parse(query: str, llm) -> Optional[dict]:
         raw = llm.generate(
             prompt=prompt,
             system_prompt=_PARSE_SYSTEM_PROMPT,
-            max_tokens=256,
+            max_tokens=512,
             temperature=0.0,
         )
         if not raw:
@@ -213,6 +220,22 @@ _PROPERTY_TYPE_MAP = [
     ("Phòng trọ", ["phòng trọ", "trọ"]),
     ("Shophouse", ["shophouse"]),
 ]
+
+_PROPERTY_TYPE_ALIASES = {
+    "can ho chung cu": "Căn hộ chung cư",
+    "căn hộ chung cư": "Căn hộ chung cư",
+    "chung cu": "Căn hộ chung cư",
+    "chung cư": "Căn hộ chung cư",
+    "nha rieng": "Nhà riêng",
+    "nhà riêng": "Nhà riêng",
+    "nha pho": "Nhà riêng",
+    "nhà phố": "Nhà riêng",
+    "dat": "Đất",
+    "đất": "Đất",
+    "biet thu": "Nhà biệt thự, liền kề",
+    "biệt thự": "Nhà biệt thự, liền kề",
+    "shophouse": "Shophouse",
+}
 
 
 def _regex_extract_filters(text: str) -> dict:
@@ -292,6 +315,41 @@ def _extract_lifestyle_signals(text: str) -> list[str]:
     return [sig for sig, phrases in _LIFESTYLE_SIGNAL_MAP if any(p in text for p in phrases)]
 
 
+def _infer_listing_type(text: str) -> Optional[str]:
+    """Infer sale/rental intent from the original Vietnamese query."""
+    rent_terms = [
+        "thuê",
+        "thue",
+        "cho thuê",
+        "cho thue",
+        "rent",
+        "rental",
+    ]
+    sale_terms = [
+        "mua",
+        "bán",
+        "ban",
+        "cần mua",
+        "can mua",
+        "tìm mua",
+        "tim mua",
+    ]
+    if any(term in text for term in rent_terms):
+        return "cho_thue"
+    if any(term in text for term in sale_terms):
+        return "ban"
+    return None
+
+
+def _canonicalize_filters(filters: dict) -> dict:
+    filters = dict(filters or {})
+    prop_type = filters.get("loai_nha_dat")
+    if prop_type:
+        key = _strip_accents(str(prop_type).strip().lower())
+        filters["loai_nha_dat"] = _PROPERTY_TYPE_ALIASES.get(key, prop_type)
+    return filters
+
+
 # ---------------------------------------------------------------------------
 # Main Parser
 # ---------------------------------------------------------------------------
@@ -353,6 +411,10 @@ class QueryParser:
 
         raw_filters = data.get("filters") or {}
         filters = {k: v for k, v in raw_filters.items() if v is not None and v != ""}
+        inferred_listing_type = _infer_listing_type(raw.lower())
+        if inferred_listing_type and "loai_hinh" not in filters:
+            filters["loai_hinh"] = inferred_listing_type
+        filters = _canonicalize_filters(filters)
 
         # Determine union of all collections for all detected intents
         collections = []
@@ -401,6 +463,10 @@ class QueryParser:
             intents.append("ask_knowledge")
 
         filters = _regex_extract_filters(text)
+        inferred_listing_type = _infer_listing_type(text)
+        if inferred_listing_type:
+            filters["loai_hinh"] = inferred_listing_type
+        filters = _canonicalize_filters(filters)
 
         collections = []
         for i in intents:

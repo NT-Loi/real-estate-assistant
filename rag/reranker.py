@@ -8,6 +8,7 @@ retrieval ordering.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable
 
 from db.config import RERANKER_MAX_LENGTH, RERANKER_MODEL
@@ -36,6 +37,8 @@ class VietnameseReranker:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+            hf_token = os.getenv("HF_TOKEN") or None
             log.info("Loading reranker model: %s", self._model_name)
             try:
                 self._tokenizer = AutoTokenizer.from_pretrained(
@@ -48,8 +51,11 @@ class VietnameseReranker:
                 )
             except Exception:
                 log.info("Reranker not cached yet; attempting HuggingFace download")
-                self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
-                self._model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
+                self._tokenizer = AutoTokenizer.from_pretrained(self._model_name, token=hf_token)
+                self._model = AutoModelForSequenceClassification.from_pretrained(
+                    self._model_name,
+                    token=hf_token,
+                )
 
             self._model.to(self._device)
             self._model.eval()

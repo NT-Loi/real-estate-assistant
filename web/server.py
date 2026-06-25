@@ -105,11 +105,15 @@ def price_vnd(raw: object) -> int | None:
     return int(num * 1_000_000) if num > 100 else None
 
 def first_line(raw: object) -> str:
-    return str(raw or "").splitlines()[0].replace(". Xem bản đồ", "").strip()
+    lines = str(raw or "").splitlines()
+    if not lines:
+        return ""
+    return lines[0].replace(". Xem bản đồ", "").strip()
 
 def location_parts(address: str, fallback_area: str = "") -> dict[str, str]:
-    parts = [p.strip() for p in first_line(address or fallback_area).split(",") if p.strip()]
-    province = parts[-1] if parts else fallback_area
+    fallback = first_line(fallback_area)
+    parts = [p.strip() for p in first_line(address or fallback).split(",") if p.strip()]
+    province = parts[-1] if parts else fallback
     district = ""
     ward = ""
     for part in parts:
@@ -118,7 +122,7 @@ def location_parts(address: str, fallback_area: str = "") -> dict[str, str]:
             district = part
         if lower.startswith(("phường ", "xã ", "thị trấn ")):
             ward = part
-    province = province.replace("Hồ Chí Minh mới", "Hồ Chí Minh").replace("Ninh Bình mới", "Ninh Bình")
+    province = str(province or "").replace("Hồ Chí Minh mới", "Hồ Chí Minh").replace("Ninh Bình mới", "Ninh Bình")
     return {"province": province, "district": district, "ward": ward}
 
 def stable_offset(seed: str, scale: float = 0.035) -> tuple[float, float]:
@@ -188,7 +192,7 @@ def listing_stats(rows: list[dict]) -> dict:
     return {
         "count": len(rows),
         "sale_count": sum(1 for r in rows if r["listing_type"] == "ban"),
-        "rent_count": sum(1 for r in rows if r["listing_type"] == "cho-thue"),
+        "rent_count": sum(1 for r in rows if r["listing_type"] in {"cho_thue", "cho-thue"}),
         "median_price_vnd": sorted(priced)[len(priced) // 2] if priced else None,
         "avg_area_m2": round(sum(areas) / len(areas), 1) if areas else None,
         "approximate_geo_count": sum(1 for r in rows if r["geo_precision"] == "approximate"),

@@ -101,29 +101,29 @@ class PostgresClient:
             """
             CREATE TABLE IF NOT EXISTS listings (
                 id VARCHAR(64) PRIMARY KEY,
-                loai_hinh VARCHAR(32),
-                loai_nha_dat VARCHAR(64),
-                province VARCHAR(128),
-                district VARCHAR(128),
-                ward VARCHAR(128),
+                loai_hinh TEXT,
+                loai_nha_dat TEXT,
+                province TEXT,
+                district TEXT,
+                ward TEXT,
                 khu_vuc TEXT,
                 dia_chi TEXT,
                 price_vnd BIGINT,
                 gia_trieu DOUBLE PRECISION,
                 price_per_m2_vnd BIGINT,
-                gia_per_m2 VARCHAR(64),
-                gia_raw VARCHAR(64),
+                gia_per_m2 TEXT,
+                gia_raw TEXT,
                 dien_tich_m2 DOUBLE PRECISION,
                 so_phong_ngu INTEGER,
                 so_phong_tam INTEGER,
-                huong_nha VARCHAR(32),
-                huong_ban_cong VARCHAR(32),
-                phap_ly VARCHAR(128),
-                noi_that VARCHAR(128),
+                huong_nha TEXT,
+                huong_ban_cong TEXT,
+                phap_ly TEXT,
+                noi_that TEXT,
                 tieu_de TEXT,
                 mo_ta TEXT,
                 mo_ta_chi_tiet TEXT,
-                du_an VARCHAR(256),
+                du_an TEXT,
                 so_tang INTEGER,
                 mat_tien DOUBLE PRECISION,
                 duong_vao DOUBLE PRECISION,
@@ -139,8 +139,8 @@ class PostgresClient:
                 project_id VARCHAR(64),
                 url TEXT UNIQUE,
                 hinh_anh TEXT[],
-                ngay_dang VARCHAR(64),
-                nguoi_dang VARCHAR(128),
+                ngay_dang TEXT,
+                nguoi_dang TEXT,
                 raw_json JSONB,
                 crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -149,28 +149,28 @@ class PostgresClient:
             """
             CREATE TABLE IF NOT EXISTS projects (
                 id VARCHAR(64) PRIMARY KEY,
-                ten_du_an VARCHAR(256),
-                loai_du_an VARCHAR(128),
-                chu_dau_tu VARCHAR(256),
-                province VARCHAR(128),
-                district VARCHAR(128),
-                ward VARCHAR(128),
+                ten_du_an TEXT,
+                loai_du_an TEXT,
+                chu_dau_tu TEXT,
+                province TEXT,
+                district TEXT,
+                ward TEXT,
                 khu_vuc TEXT,
                 dia_chi TEXT,
                 quy_mo TEXT,
                 dien_tich_m2 DOUBLE PRECISION,
                 latitude DOUBLE PRECISION,
                 longitude DOUBLE PRECISION,
-                gia VARCHAR(128),
+                gia TEXT,
                 gia_tu_vnd BIGINT,
                 gia_den_vnd BIGINT,
-                trang_thai VARCHAR(128),
-                phap_ly VARCHAR(128),
+                trang_thai TEXT,
+                phap_ly TEXT,
                 so_toa INTEGER,
                 so_can_ho INTEGER,
                 nam_ban_giao INTEGER,
                 nam_khoi_cong INTEGER,
-                mat_do_xay_dung VARCHAR(64),
+                mat_do_xay_dung TEXT,
                 mo_ta_chi_tiet TEXT,
                 tien_ich TEXT[],
                 thumbnail_url TEXT,
@@ -206,9 +206,9 @@ class PostgresClient:
                 mo_ta TEXT,
                 mo_ta_chi_tiet TEXT,
                 url TEXT,
-                source_type VARCHAR(32),
-                danh_muc VARCHAR(128),
-                ngay_dang VARCHAR(64),
+                source_type TEXT,
+                danh_muc TEXT,
+                ngay_dang TEXT,
                 raw_json JSONB,
                 crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -217,11 +217,11 @@ class PostgresClient:
             """
             CREATE TABLE IF NOT EXISTS social_neighborhood (
                 id VARCHAR(64) PRIMARY KEY,
-                source_type VARCHAR(32),
-                keyword VARCHAR(256),
+                source_type TEXT,
+                keyword TEXT,
                 linked_location_id VARCHAR(64),
                 linked_project_id VARCHAR(64),
-                video_id VARCHAR(64),
+                video_id TEXT,
                 thread_url TEXT,
                 stats_views BIGINT,
                 stats_likes BIGINT,
@@ -262,8 +262,10 @@ class PostgresClient:
         with self.get_cursor() as cur:
             for q in queries:
                 cur.execute(q)
-            self._ensure_columns(cur)
+            map_pins_dropped = self._ensure_columns(cur)
             self._ensure_indexes(cur, postgis_available)
+        if map_pins_dropped:
+            self.refresh_map_pins()
         log.info("PostgreSQL table schemas verified/initialized successfully.")
 
     def _ensure_columns(self, cur):
@@ -285,6 +287,20 @@ class PostgresClient:
             "ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
             "ALTER TABLE listings ADD COLUMN IF NOT EXISTS expires_at DATE;",
             "ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_change_pct DOUBLE PRECISION;",
+            "ALTER TABLE listings ALTER COLUMN loai_hinh TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN loai_nha_dat TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN province TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN district TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN ward TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN gia_per_m2 TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN gia_raw TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN huong_nha TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN huong_ban_cong TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN phap_ly TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN noi_that TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN du_an TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN ngay_dang TYPE TEXT;",
+            "ALTER TABLE listings ALTER COLUMN nguoi_dang TYPE TEXT;",
             # projects — original
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS province VARCHAR(128);",
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS district VARCHAR(128);",
@@ -295,6 +311,16 @@ class PostgresClient:
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS gia_tu_vnd BIGINT;",
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS gia_den_vnd BIGINT;",
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS thumbnail_url TEXT;",
+            "ALTER TABLE projects ALTER COLUMN ten_du_an TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN loai_du_an TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN chu_dau_tu TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN province TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN district TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN ward TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN gia TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN trang_thai TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN phap_ly TYPE TEXT;",
+            "ALTER TABLE projects ALTER COLUMN mat_do_xay_dung TYPE TEXT;",
             # social
             "ALTER TABLE social_neighborhood ADD COLUMN IF NOT EXISTS linked_location_id VARCHAR(64);",
             "ALTER TABLE social_neighborhood ADD COLUMN IF NOT EXISTS linked_project_id VARCHAR(64);",
@@ -302,11 +328,52 @@ class PostgresClient:
             "ALTER TABLE social_neighborhood ADD COLUMN IF NOT EXISTS sentiment_score DOUBLE PRECISION;",
             "ALTER TABLE social_neighborhood ADD COLUMN IF NOT EXISTS topic_tags TEXT[] DEFAULT '{}';",
             "ALTER TABLE social_neighborhood ADD COLUMN IF NOT EXISTS published_at TIMESTAMP;",
+            "ALTER TABLE social_neighborhood ALTER COLUMN source_type TYPE TEXT;",
+            "ALTER TABLE social_neighborhood ALTER COLUMN keyword TYPE TEXT;",
+            "ALTER TABLE social_neighborhood ALTER COLUMN video_id TYPE TEXT;",
             # articles — drop stale UNIQUE constraint on url (chunks share a url, only id is unique)
             "ALTER TABLE articles DROP CONSTRAINT IF EXISTS articles_url_key;",
+            "ALTER TABLE articles ALTER COLUMN source_type TYPE TEXT;",
+            "ALTER TABLE articles ALTER COLUMN danh_muc TYPE TEXT;",
+            "ALTER TABLE articles ALTER COLUMN ngay_dang TYPE TEXT;",
         ]
+        map_pins_dropped = False
         for q in column_queries:
-            cur.execute(q)
+            if self._is_redundant_text_type_alter(cur, q):
+                continue
+            try:
+                cur.execute(q)
+            except psycopg2.errors.FeatureNotSupported as exc:
+                if "map_pins" not in str(exc):
+                    raise
+                cur.execute("DROP MATERIALIZED VIEW IF EXISTS map_pins;")
+                map_pins_dropped = True
+                cur.execute(q)
+        return map_pins_dropped
+
+    def _is_redundant_text_type_alter(self, cur, query: str) -> bool:
+        """Skip no-op TEXT migrations so map_pins can survive normal startup."""
+        match = re.fullmatch(
+            r"ALTER TABLE\s+(\w+)\s+ALTER COLUMN\s+(\w+)\s+TYPE\s+TEXT;",
+            query.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return False
+
+        table_name, column_name = match.groups()
+        cur.execute(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+              AND column_name = %s
+            """,
+            (table_name, column_name),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0] == "text")
 
     def _ensure_indexes(self, cur, postgis_available: bool):
         """Create indexes used by filters, market reports, and geo ranking."""

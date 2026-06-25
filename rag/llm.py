@@ -6,7 +6,7 @@ Configuration (via .env or environment variables):
   PROJECT_ID       — GCP project ID (required when LLM_PROVIDER=vertexai).
   VERTEX_LOCATION  — Vertex AI location (optional, default: "global").
   GEMINI_API_KEY   — required when LLM_PROVIDER=gemini.
-  GEMINI_MODEL     — optional. Default: gemini-2.5-flash-lite.
+  GEMINI_MODEL     — optional. Default: gemini-2.5-flash.
 
 Falls back to a formatted text response if no LLM provider is available.
 """
@@ -43,7 +43,7 @@ class LLMClient:
     ):
         self._provider = provider or os.environ.get("LLM_PROVIDER", "").lower()
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
-        self._model_name = model_name or os.environ.get("GEMINI_MODEL")
+        self._model_name = model_name or os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
 
         self._project_id = os.environ.get("PROJECT_ID", "")
         self._vertex_location = os.environ.get("VERTEX_LOCATION", "global")
@@ -197,7 +197,7 @@ class LLMClient:
 
             # Try primary model, then fallback models on rate-limit
             models_to_try = [self._model_name]
-            if self._model_name not in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
+            if self._model_name not in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
                 models_to_try.append("gemini-2.0-flash")
 
             last_error = None
@@ -334,7 +334,7 @@ class LLMClient:
             )
 
             models_to_try = [self._model_name]
-            if self._model_name not in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
+            if self._model_name not in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
                 models_to_try.append("gemini-2.0-flash")
 
             for model in models_to_try:
@@ -382,7 +382,11 @@ class LLMClient:
                 for part in parts
                 if not getattr(part, "thought", False) and part.text
             ]
-            return "".join(texts)
+            joined = "".join(texts)
+            raw_text = getattr(response, "text", "") or ""
+            if raw_text and len(raw_text) > len(joined):
+                return raw_text
+            return joined
         except (IndexError, AttributeError):
             # Fallback: use response.text which may include thought tokens
             return response.text or ""
