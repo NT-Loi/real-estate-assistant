@@ -14,6 +14,7 @@ data-Loi
 docs
 db_data
 bds_embeddings
+logs
 
 *.zip
 cookies_bds.txt

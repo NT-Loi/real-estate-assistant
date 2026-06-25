@@ -3,6 +3,14 @@ import { marked } from 'marked';
 
 const getLeaflet = () => window.L;
 
+const getChatSessionId = () => {
+  const existing = localStorage.getItem('bds-chat-session-id');
+  if (existing) return existing;
+  const generated = `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  localStorage.setItem('bds-chat-session-id', generated);
+  return generated;
+};
+
 const escapeHtml = (value) => String(value ?? '')
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -197,6 +205,7 @@ function CompareTable({ items, onClose, onSubmitAnalysis }) {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('chat');
+  const [chatSessionId] = useState(getChatSessionId);
   const [theme, setTheme] = useState(localStorage.getItem('color-scheme') || 'auto');
   const [allListings, setAllListings] = useState([]);
   const [listings, setListings] = useState([]);
@@ -527,7 +536,7 @@ export default function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: cleanMsg }),
+        body: JSON.stringify({ message: cleanMsg, session_id: chatSessionId }),
       });
       if (!res.ok || !res.body) throw new Error(`Server error: ${res.status}`);
 
@@ -567,7 +576,7 @@ export default function App() {
             } else {
               setLastChatListings(null);
             }
-          } else if (eventType === 'thought' || eventType === 'observation') {
+          } else if (eventType === 'thought' || eventType === 'tool_call' || eventType === 'observation') {
             const text = JSON.parse(dataStr);
             setChatMessages((prev) => {
               const updated = [...prev];
@@ -701,7 +710,7 @@ export default function App() {
                             <div className="thinking-content">
                               {msg.thinkingProcess.map((step, idx) => (
                                 <div key={`${step.type}-${idx}`} className={`think-step ${step.type}`}>
-                                  <strong>{step.type === 'thought' ? 'Agent' : 'System'}:</strong>
+                                  <strong>{step.type === 'thought' ? 'Agent' : step.type === 'tool_call' ? 'Tool Call' : 'System'}:</strong>
                                   <pre>{step.text}</pre>
                                 </div>
                               ))}

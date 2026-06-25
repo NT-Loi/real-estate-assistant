@@ -2,7 +2,9 @@ import logging
 import json
 import re
 import hashlib
+import os
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import psycopg2
 from psycopg2.extras import execute_values
@@ -20,23 +22,29 @@ from db.normalizer import (
 
 log = logging.getLogger("bds_database.postgres")
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+except Exception:
+    pass
+
 class PostgresClient:
     """Manages transactional relational data tables inside PostgreSQL 16."""
     
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 5432,
-        user: str = "postgres",
-        password: str = "postgres",
-        database: str = "real_estate"
+        host: str | None = None,
+        port: int | None = None,
+        user: str | None = None,
+        password: str | None = None,
+        database: str | None = None,
     ):
         self.conn_params = {
-            "host": host,
-            "port": port,
-            "user": user,
-            "password": password,
-            "dbname": database
+            "host": host or os.getenv("POSTGRES_HOST", "localhost"),
+            "port": port or int(os.getenv("POSTGRES_PORT", "5432")),
+            "user": user or os.getenv("POSTGRES_USER", "postgres"),
+            "password": password or os.getenv("POSTGRES_PASSWORD", "postgres"),
+            "dbname": database or os.getenv("POSTGRES_DB", "real_estate"),
         }
         self.conn = None
         self.connect()
@@ -1104,6 +1112,131 @@ class PostgresClient:
             log.warning(f"fetch_nearby_pois failed: {e}")
         return output
 
+    def resolve_location_point(self, query: str) -> Optional[Dict[str, Any]]:
+        """Resolve a local project/listing/POI name or address to lat/lon."""
+        if not query:
+            return None
+
+        like = f"%{query}%"
+        searches = [
+            (
+                "project",
+                """
+                SELECT id, ten_du_an AS name, dia_chi AS address, latitude, longitude, url
+                FROM projects
+                WHERE latitude IS NOT NULL
+                  AND longitude IS NOT NULL
+                  AND (ten_du_an ILIKE %s OR dia_chi ILIKE %s OR khu_vuc ILIKE %s)
+                ORDER BY
+                  CASE WHEN ten_du_an ILIKE %s THEN 0 ELSE 1 END,
+                  ten_du_an
+                LIMIT 1
+                """,
+                (like, like, like, like),
+            ),
+            (
+                "listing",
+                """
+                SELECT id, COALESCE(NULLIF(du_an, ''), tieu_de) AS name, dia_chi AS address, latitude, longitude, url
+                FROM listings
+                WHERE latitude IS NOT NULL
+                  AND longitude IS NOT NULL
+                  AND (tieu_de ILIKE %s OR du_an ILIKE %s OR dia_chi ILIKE %s OR khu_vuc ILIKE %s)
+                ORDER BY
+                  CASE WHEN du_an ILIKE %s THEN 0 WHEN tieu_de ILIKE %s THEN 1 ELSE 2 END,
+                  tieu_de
+                LIMIT 1
+                """,
+                (like, like, like, like, like, like),
+            ),
+            (
+                "poi",
+                """
+                SELECT id, name, address, latitude, longitude, NULL::text AS url
+                FROM pois
+                WHERE latitude IS NOT NULL
+                  AND longitude IS NOT NULL
+                  AND (name ILIKE %s OR address ILIKE %s)
+                ORDER BY
+                  CASE WHEN name ILIKE %s THEN 0 ELSE 1 END,
+                  name
+                LIMIT 1
+                """,
+                (like, like, like),
+            ),
+        ]
+
+        try:
+            with self.get_cursor() as cur:
+                for source_type, sql, params in searches:
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                    if not row:
+                        continue
+                    cols = [d[0] for d in cur.description]
+                    item = dict(zip(cols, row))
+                    item["source_type"] = source_type
+                    return item
+        except Exception as e:
+            log.warning(f"resolve_location_point failed: {e}")
+        return None
+
+    def fetch_pois_near_point(
+        self,
+        lat: float,
+        lon: float,
+        categories: Optional[List[str]] = None,
+        radius_m: float = 2000,
+        top_n_per_category: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Fetch POIs near an arbitrary coordinate, grouped by nearest per category."""
+        category_filter = ""
+        params: list[Any] = [lon, lat, radius_m]
+        if categories:
+            category_filter = "AND p.category = ANY(%s)"
+            params.append(categories)
+
+        q = f"""
+            WITH origin AS (
+                SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography AS geom
+            ),
+            ranked AS (
+                SELECT
+                    p.id,
+                    p.name,
+                    p.category,
+                    p.address,
+                    p.latitude,
+                    p.longitude,
+                    p.rating,
+                    p.review_count,
+                    ST_Distance(origin.geom, p.geom) AS distance_m,
+                    row_number() OVER (
+                        PARTITION BY p.category
+                        ORDER BY ST_Distance(origin.geom, p.geom)
+                    ) AS rn
+                FROM pois p, origin
+                WHERE p.geom IS NOT NULL
+                  AND ST_DWithin(origin.geom, p.geom, %s)
+                  {category_filter}
+            )
+            SELECT id, name, category, address, latitude, longitude,
+                   rating, review_count, distance_m
+            FROM ranked
+            WHERE rn <= %s
+            ORDER BY category, distance_m;
+        """
+        params.append(top_n_per_category)
+
+        try:
+            with self.get_cursor() as cur:
+                cur.execute(q, tuple(params))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+        except Exception as e:
+            log.warning(f"fetch_pois_near_point failed: {e}")
+            return []
+
     def fetch_market_stats(
         self,
         province: Optional[str] = None,
@@ -1140,11 +1273,13 @@ class PostgresClient:
         params: Dict[str, Any] = {"months": f"{months} months"}
 
         if province:
-            conditions.append("province ILIKE %(province)s")
-            params["province"] = f"%{province}%"
+            province_query = re.sub(r"\s+", " ", str(province).replace(".", " ")).strip()
+            conditions.append("regexp_replace(province, '[\\.]', ' ', 'g') ILIKE %(province)s")
+            params["province"] = f"%{province_query}%"
         if district:
-            conditions.append("district ILIKE %(district)s")
-            params["district"] = f"%{district}%"
+            district_query = re.sub(r"\s+", " ", str(district).replace(".", " ")).strip()
+            conditions.append("(district ILIKE %(district)s OR ward ILIKE %(district)s)")
+            params["district"] = f"%{district_query}%"
         if listing_type:
             conditions.append("listing_type = %(listing_type)s")
             params["listing_type"] = listing_type
@@ -1158,6 +1293,7 @@ class PostgresClient:
                 to_char(period, 'YYYY-MM') AS period,
                 province,
                 district,
+                ward,
                 property_type,
                 listing_type,
                 listing_count,

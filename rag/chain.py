@@ -12,11 +12,15 @@ Usage:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from rag.query_parser import QueryParser, ParsedQuery
@@ -32,6 +36,178 @@ from rag.finance_calculator import FinanceCalculator
 from db.vectorstore import VectorStore
 
 log = logging.getLogger("bds_chain")
+trace_log = logging.getLogger("bds_agent_trace")
+
+
+def _setup_trace_logger() -> logging.Logger:
+    """Configure JSONL trace logging for LLM/tool debugging."""
+    if trace_log.handlers:
+        return trace_log
+
+    trace_path = os.getenv("AGENT_TRACE_LOG", "logs/agent_trace.log")
+    path = Path(trace_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent.parent / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    trace_log.addHandler(handler)
+    trace_log.setLevel(logging.INFO)
+    trace_log.propagate = False
+    return trace_log
+
+
+def _clip_for_trace(value: Any, max_chars: int = 12000) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= max_chars else value[:max_chars] + "\n...[trace truncated]..."
+    if isinstance(value, dict):
+        return {k: _clip_for_trace(v, max_chars=max_chars) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clip_for_trace(v, max_chars=max_chars) for v in value[:50]]
+    return value
+
+
+TRACE_TEXT_FIELDS = {
+    "answer",
+    "candidate_answer",
+    "draft",
+    "observation",
+    "raw_final",
+    "response",
+}
+
+
+def _trace_text_summary(value: Any) -> dict[str, Any]:
+    text = str(value or "")
+    return {
+        "redacted": True,
+        "chars": len(text),
+        "sha256_12": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "",
+    }
+
+
+def _sanitize_trace_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove generated/tool text from agent_trace unless explicitly enabled."""
+    if _env_flag("AGENT_TRACE_INCLUDE_TEXT", False):
+        return payload
+
+    sanitized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in TRACE_TEXT_FIELDS:
+            sanitized[f"{key}_summary"] = _trace_text_summary(value)
+        elif key == "function_calls" and isinstance(value, list):
+            sanitized[key] = [
+                {
+                    "name": item.get("name", "") if isinstance(item, dict) else "",
+                    "args": item.get("args", {}) if isinstance(item, dict) else {},
+                }
+                for item in value
+            ]
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Invalid integer for %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("Invalid float for %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _chat_tool_temperature() -> float:
+    """Low temperature for tool planning/function calls."""
+    return _env_float("CHAT_TOOL_TEMPERATURE", _env_float("LLM_TOOL_TEMPERATURE", 0.1))
+
+
+def _chat_answer_temperature() -> float:
+    """Low-but-readable temperature for the final user-facing answer."""
+    return _env_float("CHAT_ANSWER_TEMPERATURE", _env_float("LLM_TEMPERATURE", 0.3))
+
+
+def _is_llm_failure_text(text: str | None) -> bool:
+    normalized = _normalize_text(text or "")
+    return "khong the tao cau tra loi" in normalized and "vui long thu lai" in normalized
+
+
+def _extract_balanced_json_object(text: str, start: int = 0) -> tuple[str | None, int]:
+    """Extract the first balanced JSON object in text starting at or after index."""
+    brace_start = text.find("{", start)
+    if brace_start == -1:
+        return None, -1
+
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(brace_start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_start : idx + 1], idx + 1
+
+    return None, -1
+
+
+def _parse_action_call(response: str) -> tuple[str | None, str | None]:
+    """Find the first valid ReAct action call in a model response."""
+    for match in re.finditer(r"Action:\s*`?(\w+)`?", response, re.IGNORECASE):
+        tool_name = match.group(1).strip()
+        args_str, _ = _extract_balanced_json_object(response, match.end())
+        if not args_str:
+            return tool_name, None
+        try:
+            json.loads(args_str)
+            return tool_name, args_str
+        except Exception:
+            # Try later Action blocks if the model emitted more than one.
+            continue
+    return None, None
+
+
+def _db_listing_type(value: object) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"cho_thue", "thue", "rent", "rental"}:
+        return "cho-thue"
+    if normalized in {"ban", "mua", "sale", "sell"}:
+        return "ban"
+    return str(value or "").strip()
 
 
 HCMC_METRO_STATIONS: list[dict[str, Any]] = [
@@ -250,6 +426,15 @@ class RAGResponse:
     filters_applied: dict                    # Metadata filters that were applied
     parsed_query: Optional[ParsedQuery] = None  # Full parsed query details
     llm_used: bool = False                   # Whether LLM was used for generation
+    effective_query: str = ""                # Query after multi-turn merge, if any
+
+
+@dataclass
+class ConversationState:
+    """Small in-memory state for pending clarification follow-ups."""
+    pending_query: str = ""
+    pending_questions: list[str] = field(default_factory=list)
+    last_answer: str = ""
 
 
 class RAGChain:
@@ -263,11 +448,12 @@ class RAGChain:
         llm: Optional[LLMClient] = None,
     ):
         self._store = store or VectorStore()
-        self._parser = QueryParser()
         self._retriever = Retriever(self._store)
         self._llm = llm or LLMClient()
+        self._parser = QueryParser(llm=self._llm)
         self._agent_sources = []
         self._current_parsed: Optional[ParsedQuery] = None
+        self._conversations: dict[str, ConversationState] = {}
 
         # Optional warm-up. Keep disabled by default so keyword/tools/UI can
         # start even when the embedding model is not cached locally yet.
@@ -283,6 +469,79 @@ class RAGChain:
         log.info("RAG Chain initialized in Agentic mode")
         log.info(f"  LLM available: {self._llm.is_available}")
         log.info(f"  Collections: {self._store.stats()}")
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        """Write a structured JSONL trace entry for agent debugging."""
+        try:
+            payload = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": event,
+                **fields,
+            }
+            _setup_trace_logger().info(
+                json.dumps(_clip_for_trace(_sanitize_trace_payload(payload)), ensure_ascii=False, default=str)
+            )
+        except Exception as exc:
+            log.debug("Agent trace logging failed: %s", exc)
+
+    def _get_conversation(self, session_id: Optional[str]) -> Optional[ConversationState]:
+        if not session_id:
+            return None
+        return self._conversations.setdefault(session_id, ConversationState())
+
+    def _is_reset_message(self, message: str) -> bool:
+        norm = _normalize_text(message)
+        return norm in {
+            "reset",
+            "clear",
+            "xoa",
+            "xoa bo nho",
+            "bat dau lai",
+            "hoi moi",
+            "new search",
+            "tim kiem moi",
+        }
+
+    def _prepare_query_for_session(self, user_query: str, session_id: Optional[str]) -> str:
+        """Merge a clarification follow-up with the previous pending query."""
+        state = self._get_conversation(session_id)
+        if state is None:
+            return user_query
+
+        if self._is_reset_message(user_query):
+            self._conversations.pop(session_id or "", None)
+            return user_query
+
+        if state.pending_query:
+            merged = (
+                f"{state.pending_query}\n\n"
+                f"Thông tin bổ sung từ người dùng trong lượt sau: {user_query}"
+            )
+            state.pending_query = ""
+            state.pending_questions = []
+            return merged
+
+        return user_query
+
+    def _remember_or_clear_conversation(
+        self,
+        session_id: Optional[str],
+        effective_query: str,
+        parsed: ParsedQuery,
+        answer: str,
+    ) -> None:
+        state = self._get_conversation(session_id)
+        if state is None:
+            return
+
+        if self._should_ask_clarification_only(parsed, answer):
+            state.pending_query = effective_query
+            state.pending_questions = self._clarification_questions(parsed)
+            state.last_answer = answer
+        else:
+            state.pending_query = ""
+            state.pending_questions = []
+            state.last_answer = answer
 
     # ---------------------------------------------------------------------------
     # Tools definition
@@ -382,7 +641,7 @@ class RAGChain:
             listing_type = kwargs.get("loai_hinh") or kwargs.get("listing_type")
             if listing_type:
                 clauses.append("loai_hinh = %s")
-                params.append(str(listing_type))
+                params.append(_db_listing_type(listing_type))
                 
             tinh_thanh = kwargs.get("tinh_thanh")
             if tinh_thanh:
@@ -505,6 +764,83 @@ class RAGChain:
             return "\n".join(lines)
         except Exception as e:
             return f"Lỗi khi tìm tiện ích lân cận: {e}"
+
+    def _tool_find_pois_near_location(
+        self,
+        location_name: Optional[str] = None,
+        lat: Optional[float] = None,
+        lon: Optional[float] = None,
+        categories: Optional[list[str]] = None,
+        radius_m: float = 2000,
+        top_n_per_category: int = 8,
+    ) -> str:
+        """Find POIs around an arbitrary place/project name or coordinate."""
+        try:
+            categories = categories or ["school", "hospital", "park"]
+            resolved = None
+            if lat is None or lon is None:
+                if not location_name:
+                    return "Thiếu location_name hoặc lat/lon để tìm POI theo bán kính."
+                resolved = self._store.pg.resolve_location_point(location_name)
+                if not resolved:
+                    return (
+                        f"Không tìm thấy tọa độ nội bộ đủ tin cậy cho: {location_name}. "
+                        "Hãy dùng tên dự án/tin đăng rõ hơn hoặc cung cấp lat/lon."
+                    )
+                lat = float(resolved["latitude"])
+                lon = float(resolved["longitude"])
+
+            radius_m = max(100, min(float(radius_m or 2000), 10000))
+            pois = self._store.pg.fetch_pois_near_point(
+                lat=float(lat),
+                lon=float(lon),
+                categories=categories,
+                radius_m=radius_m,
+                top_n_per_category=max(1, min(int(top_n_per_category or 8), 20)),
+            )
+
+            loc_label = location_name or f"{lat}, {lon}"
+            if resolved:
+                loc_label = f"{resolved.get('name') or location_name} ({resolved.get('source_type')})"
+            lines = [f"Tiện ích trong bán kính {radius_m:.0f}m quanh {loc_label}:"]
+            if resolved:
+                lines.append(
+                    f"Tọa độ đã dùng: {resolved.get('latitude')}, {resolved.get('longitude')} - "
+                    f"{resolved.get('address') or 'không rõ địa chỉ'}"
+                )
+            if not pois:
+                lines.append("- Chưa có POI phù hợp trong bán kính yêu cầu.")
+                return "\n".join(lines)
+
+            for poi in pois:
+                dist = poi.get("distance_m")
+                dist_text = f"{dist:.0f}m" if isinstance(dist, (int, float)) else "chưa rõ khoảng cách"
+                rating = poi.get("rating")
+                rating_text = f", rating {rating}" if rating is not None else ""
+                lines.append(
+                    f"- {poi.get('category')}: {poi.get('name')} ({dist_text}{rating_text})"
+                    + (f" - {poi.get('address')}" if poi.get("address") else "")
+                )
+
+            from rag.retriever import RetrievedDocument
+            doc = RetrievedDocument(
+                text="\n".join(lines),
+                metadata={
+                    "location_name": location_name or "",
+                    "lat": lat,
+                    "lon": lon,
+                    "radius_m": radius_m,
+                    "categories": categories,
+                    "resolved": resolved or {},
+                },
+                score=1.0,
+                collection="pois_near_location",
+                record={"pois": pois, "resolved": resolved},
+            )
+            self._agent_sources.append(doc)
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Lỗi khi tìm POI quanh địa điểm: {e}"
 
     def _find_poi_candidates(
         self,
@@ -659,6 +995,8 @@ class RAGChain:
 
             active_filters = self._current_filters()
             loai_hinh = loai_hinh or active_filters.get("loai_hinh")
+            if loai_hinh:
+                loai_hinh = _db_listing_type(loai_hinh)
             property_type = property_type or active_filters.get("loai_nha_dat")
             price_filter = active_filters.get("gia_trieu")
             bedrooms = active_filters.get("so_phong_ngu")
@@ -848,6 +1186,7 @@ class RAGChain:
             tinh_thanh = kwargs.get("tinh_thanh")
             quan_huyen = kwargs.get("quan_huyen")
             property_type = kwargs.get("property_type")
+            listing_type = kwargs.get("listing_type") or kwargs.get("loai_hinh")
             target_price_vnd = kwargs.get("target_price_vnd")
             target_area_m2 = kwargs.get("target_area_m2")
             
@@ -858,6 +1197,7 @@ class RAGChain:
             rows = self._store.pg.fetch_market_stats(
                 province=tinh_thanh,
                 district=quan_huyen,
+                listing_type=_db_listing_type(listing_type) if listing_type else None,
                 property_type=property_type,
                 months=12
             )
@@ -895,6 +1235,18 @@ class RAGChain:
                 count = r.get('listing_count', 0)
                 if median_m2 > 0:
                     output.append(f"- Tháng {period}: {median_m2/1e6:.1f} triệu/m2 ({count} tin đăng)")
+
+            from rag.retriever import RetrievedDocument, _format_market_row
+            self._agent_sources.extend([
+                RetrievedDocument(
+                    text=_format_market_row(row),
+                    metadata=row,
+                    score=1.0,
+                    collection="market_snapshots",
+                    record=row,
+                )
+                for row in rows[:20]
+            ])
             
             return "\n".join(output)
         except Exception as e:
@@ -906,12 +1258,18 @@ class RAGChain:
             log.info(f"Tool called: get_market_statistics({kwargs=})")
             tinh_thanh = kwargs.get("tinh_thanh")
             quan_huyen = kwargs.get("quan_huyen")
+            property_type = kwargs.get("property_type") or kwargs.get("loai_nha_dat")
+            listing_type = kwargs.get("listing_type") or kwargs.get("loai_hinh")
             
             filters = {}
             if tinh_thanh:
                 filters["tinh_thanh"] = tinh_thanh
             if quan_huyen:
                 filters["quan_huyen"] = quan_huyen
+            if property_type:
+                filters["loai_nha_dat"] = property_type
+            if listing_type:
+                filters["loai_hinh"] = _db_listing_type(listing_type)
                 
             docs = self._retriever.retrieve_market_report(filters=filters, months=12)
             if not docs:
@@ -1166,6 +1524,45 @@ class RAGChain:
             except Exception:
                 return f"Lỗi: Không thể phân tích tham số hành động dưới dạng JSON: {args_str}. Lỗi: {e}"
 
+        return self._execute_tool_args(tool_name, args)
+
+    def _call_tool_safely(self, tool_name: str, func: Any, args: dict[str, Any]) -> str:
+        """Call a Python tool while ignoring unexpected model-supplied kwargs."""
+        try:
+            import inspect
+
+            signature = inspect.signature(func)
+            parameters = signature.parameters
+            accepts_kwargs = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in parameters.values()
+            )
+            if accepts_kwargs:
+                filtered_args = args
+                ignored_args = {}
+            else:
+                allowed = {
+                    name
+                    for name, param in parameters.items()
+                    if name != "self"
+                    and param.kind in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                }
+                filtered_args = {key: value for key, value in args.items() if key in allowed}
+                ignored_args = {key: value for key, value in args.items() if key not in allowed}
+
+            if ignored_args:
+                log.info("Ignoring unsupported args for tool %s: %s", tool_name, sorted(ignored_args))
+            return func(**filtered_args)
+        except TypeError as exc:
+            return f"Lỗi khi gọi công cụ {tool_name}: tham số không hợp lệ ({exc})"
+        except Exception as exc:
+            return f"Lỗi khi gọi công cụ {tool_name}: {exc}"
+
+    def _execute_tool_args(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Route a structured native function call to the corresponding local tool."""
         if tool_name == "semantic_search":
             return self._tool_semantic_search(
                 query_text=args.get("query_text", ""),
@@ -1185,31 +1582,485 @@ class RAGChain:
                 limit=args.get("limit", 5)
             )
         elif tool_name == "filter_listings":
-            return self._tool_filter_listings(**args)
+            return self._call_tool_safely(tool_name, self._tool_filter_listings, args)
         elif tool_name == "find_nearby_pois":
-            return self._tool_find_nearby_pois(**args)
+            return self._call_tool_safely(tool_name, self._tool_find_nearby_pois, args)
+        elif tool_name == "find_pois_near_location":
+            return self._call_tool_safely(tool_name, self._tool_find_pois_near_location, args)
         elif tool_name == "search_pois":
-            return self._tool_search_pois(**args)
+            if isinstance(args.get("category"), list):
+                observations = []
+                for category in args["category"]:
+                    per_args = {**args, "category": category}
+                    observations.append(self._call_tool_safely(tool_name, self._tool_search_pois, per_args))
+                return "\n\n".join(observations)
+            return self._call_tool_safely(tool_name, self._tool_search_pois, args)
         elif tool_name == "find_listings_near_pois":
-            return self._tool_find_listings_near_pois(**args)
+            if isinstance(args.get("category"), list):
+                observations = []
+                for category in args["category"]:
+                    per_args = {**args, "category": category}
+                    observations.append(self._call_tool_safely(tool_name, self._tool_find_listings_near_pois, per_args))
+                return "\n\n".join(observations)
+            return self._call_tool_safely(tool_name, self._tool_find_listings_near_pois, args)
         elif tool_name == "search_metro_stations":
-            return self._tool_search_metro_stations(**args)
+            return self._call_tool_safely(tool_name, self._tool_search_metro_stations, args)
         elif tool_name == "find_listings_near_metro":
-            return self._tool_find_listings_near_metro(**args)
+            return self._call_tool_safely(tool_name, self._tool_find_listings_near_metro, args)
         elif tool_name == "analyze_market_trend":
-            return self._tool_analyze_market_trend(**args)
+            return self._call_tool_safely(tool_name, self._tool_analyze_market_trend, args)
         elif tool_name == "get_market_statistics":
-            return self._tool_get_market_statistics(**args)
+            return self._call_tool_safely(tool_name, self._tool_get_market_statistics, args)
         elif tool_name == "web_search":
-            return self._tool_web_search(**args)
+            return self._call_tool_safely(tool_name, self._tool_web_search, args)
         elif tool_name == "web_research":
-            return self._tool_web_research(**args)
+            return self._call_tool_safely(tool_name, self._tool_web_research, args)
         elif tool_name == "read_url":
-            return self._tool_read_url(**args)
+            return self._call_tool_safely(tool_name, self._tool_read_url, args)
         elif tool_name == "search_location":
-            return self._tool_search_location(**args)
+            return self._call_tool_safely(tool_name, self._tool_search_location, args)
         else:
             return f"Lỗi: Không tìm thấy công cụ tên là '{tool_name}'."
+
+    def _native_tool_declarations(self) -> list[Any]:
+        """Build Gemini native function declarations for the local RAG tools."""
+        from google.genai import types
+
+        def obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+            schema: dict[str, Any] = {"type": "object", "properties": properties}
+            if required:
+                schema["required"] = required
+            return schema
+
+        string_array = {"type": "array", "items": {"type": "string"}}
+        collection_array = {
+            **string_array,
+            "description": "Collections: listings, projects, articles, social_neighborhood.",
+        }
+
+        declarations = [
+            types.FunctionDeclaration(
+                name="hybrid_search",
+                description="Tìm kiếm hybrid Qdrant dense + sparse trên nhiều nguồn nội bộ.",
+                parameters_json_schema=obj({
+                    "query_text": {"type": "string"},
+                    "collections": collection_array,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                }, ["query_text"]),
+            ),
+            types.FunctionDeclaration(
+                name="semantic_search",
+                description="Tìm kiếm ngữ nghĩa thuần trên các chunk đã embed.",
+                parameters_json_schema=obj({
+                    "query_text": {"type": "string"},
+                    "collections": collection_array,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                }, ["query_text"]),
+            ),
+            types.FunctionDeclaration(
+                name="keyword_search",
+                description="Tìm kiếm từ khóa chính xác trong Postgres.",
+                parameters_json_schema=obj({
+                    "query_text": {"type": "string"},
+                    "collections": collection_array,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                }, ["query_text"]),
+            ),
+            types.FunctionDeclaration(
+                name="filter_listings",
+                description="Lọc tin đăng theo giá, phòng ngủ, khu vực, loại nhà đất, hoặc bán kính tọa độ.",
+                parameters_json_schema=obj({
+                    "price_max_trieu": {"type": "number"},
+                    "price_min_trieu": {"type": "number"},
+                    "bedrooms": {"type": "integer"},
+                    "loai_hinh": {"type": "string", "enum": ["ban", "cho_thue"]},
+                    "tinh_thanh": {"type": "string"},
+                    "quan_huyen": {"type": "string"},
+                    "property_type": {"type": "string"},
+                    "lat": {"type": "number"},
+                    "lon": {"type": "number"},
+                    "radius_km": {"type": "number"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 40},
+                }),
+            ),
+            types.FunctionDeclaration(
+                name="search_location",
+                description="Tìm tọa độ cho một địa danh cụ thể khi người dùng nêu tên địa điểm.",
+                parameters_json_schema=obj({"location_name": {"type": "string"}}, ["location_name"]),
+            ),
+            types.FunctionDeclaration(
+                name="search_pois",
+                description="Tìm POI nội bộ theo tên hoặc loại tiện ích.",
+                parameters_json_schema=obj({
+                    "poi_query": {"type": "string"},
+                    "category": {"type": "string", "enum": ["transit_station", "school", "hospital", "park", "shopping", "airport", "landmark"]},
+                    "city": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                }),
+            ),
+            types.FunctionDeclaration(
+                name="find_listings_near_pois",
+                description="Tìm tin đăng gần một nhóm POI như metro, trường học, bệnh viện, công viên.",
+                parameters_json_schema=obj({
+                    "poi_query": {"type": "string"},
+                    "category": {"type": "string", "enum": ["transit_station", "school", "hospital", "park", "shopping", "airport", "landmark"]},
+                    "city": {"type": "string"},
+                    "radius_km": {"type": "number"},
+                    "loai_hinh": {"type": "string", "enum": ["ban", "cho_thue"]},
+                    "property_type": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 40},
+                    "poi_limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                }),
+            ),
+            types.FunctionDeclaration(
+                name="find_nearby_pois",
+                description="Tìm tiện ích gần các listing/project đã có source_record_id.",
+                parameters_json_schema=obj({
+                    "entity_ids": string_array,
+                    "entity_type": {"type": "string", "enum": ["listing", "project"]},
+                    "categories": string_array,
+                    "radius_m": {"type": "number"},
+                    "top_n_per_category": {"type": "integer", "minimum": 1, "maximum": 10},
+                }, ["entity_ids", "entity_type"]),
+            ),
+            types.FunctionDeclaration(
+                name="find_pois_near_location",
+                description="Tìm POI trong bán kính quanh một địa điểm/dự án/tọa độ cụ thể, ví dụ quanh Feliz En Vista trong 2km.",
+                parameters_json_schema=obj({
+                    "location_name": {"type": "string"},
+                    "lat": {"type": "number"},
+                    "lon": {"type": "number"},
+                    "categories": string_array,
+                    "radius_m": {"type": "number"},
+                    "top_n_per_category": {"type": "integer", "minimum": 1, "maximum": 20},
+                }),
+            ),
+            types.FunctionDeclaration(
+                name="web_search",
+                description="Tìm thông tin web bổ trợ, không dùng để tìm tin đăng BĐS.",
+                parameters_json_schema=obj({
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                }, ["query"]),
+            ),
+            types.FunctionDeclaration(
+                name="web_research",
+                description="Tìm kiếm web và trích xuất nội dung top URL để kiểm chứng thông tin ngoài.",
+                parameters_json_schema=obj({
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "extract_top": {"type": "integer", "minimum": 1, "maximum": 5},
+                }, ["query"]),
+            ),
+            types.FunctionDeclaration(
+                name="read_url",
+                description="Đọc nội dung chi tiết của một URL.",
+                parameters_json_schema=obj({"url": {"type": "string"}}, ["url"]),
+            ),
+            types.FunctionDeclaration(
+                name="analyze_market_trend",
+                description="Phân tích xu hướng giá và đối chiếu giá trị BĐS theo khu vực.",
+                parameters_json_schema=obj({
+                    "tinh_thanh": {"type": "string"},
+                    "quan_huyen": {"type": "string"},
+                    "property_type": {"type": "string"},
+                    "listing_type": {"type": "string", "enum": ["ban", "cho_thue"]},
+                    "target_price_vnd": {"type": "number"},
+                    "target_area_m2": {"type": "number"},
+                }, ["tinh_thanh", "quan_huyen"]),
+            ),
+            types.FunctionDeclaration(
+                name="get_market_statistics",
+                description="Lấy thống kê giá/diện tích/số lượng tin theo khu vực.",
+                parameters_json_schema=obj({
+                    "tinh_thanh": {"type": "string"},
+                    "quan_huyen": {"type": "string"},
+                    "property_type": {"type": "string"},
+                    "listing_type": {"type": "string", "enum": ["ban", "cho_thue"]},
+                }),
+            ),
+        ]
+        return [types.Tool(function_declarations=declarations)]
+
+    def _extract_native_function_calls(self, response: Any) -> list[Any]:
+        calls = list(getattr(response, "function_calls", None) or [])
+        if calls:
+            return calls
+        try:
+            parts = response.candidates[0].content.parts or []
+            return [part.function_call for part in parts if getattr(part, "function_call", None)]
+        except Exception:
+            return []
+
+    def _native_call_args(self, function_call: Any) -> dict[str, Any]:
+        raw_args = getattr(function_call, "args", None) or {}
+        try:
+            return json.loads(json.dumps(raw_args, ensure_ascii=False, default=str))
+        except Exception:
+            try:
+                return dict(raw_args)
+            except Exception:
+                return {}
+
+    def _native_response_text(self, response: Any) -> str:
+        return LLMClient._extract_non_thought_text(response).strip() if response else ""
+
+    def _native_agent_system_prompt(self) -> str:
+        return (
+            f"{SYSTEM_PROMPT}\n\n"
+            "Bạn đang chạy ở chế độ native function calling. Không viết `Thought:` hoặc `Action:`. "
+            "Khi cần dữ liệu, hãy gọi function phù hợp bằng structured function call. "
+            "Không tự bịa Observation; hệ thống sẽ trả kết quả function. "
+            "Ưu tiên dữ liệu nội bộ cho tin đăng/dự án/review. Chỉ dùng web_search/web_research "
+            "để kiểm chứng thông tin ngoài như ngập nước/quy hoạch/hạ tầng. "
+            "Khi đã đủ dữ liệu, trả lời cuối cùng bằng tiếng Việt Markdown, có nguồn URL. "
+            "Nếu thiếu thông tin nền tảng khiến truy vấn quá rộng, hãy hỏi 1-3 câu làm rõ."
+        )
+
+    def _use_native_function_calling(self) -> bool:
+        return _env_flag("USE_GEMINI_FUNCTION_CALLING", True) and self._llm.supports_native_tools
+
+    def _serialize_sources(self, docs: list[RetrievedDocument]) -> list[dict[str, Any]]:
+        serialized_sources = []
+        for doc in docs:
+            meta = getattr(doc, "metadata", {}) or {}
+            serialized_sources.append({
+                "collection": getattr(doc, "collection", ""),
+                "score": getattr(doc, "score", 0),
+                "text": (getattr(doc, "text", "") or "")[:1200],
+                "metadata": meta,
+                "url": meta.get("url", ""),
+            })
+        return serialized_sources
+
+    def _unique_agent_sources(self) -> list[RetrievedDocument]:
+        seen_urls = set()
+        unique_sources = []
+        for doc in self._agent_sources:
+            url = getattr(doc, "metadata", {}).get("url", "")
+            if url:
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    unique_sources.append(doc)
+            else:
+                unique_sources.append(doc)
+        return unique_sources
+
+    def _query_stream_native_gemini(
+        self,
+        user_query: str,
+        top_k: int = 5,
+        session_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Run the Gemini/Vertex agent using native function calls instead of text Action parsing."""
+        from google.genai import types
+
+        self._agent_sources = []
+        effective_query = self._prepare_query_for_session(user_query, session_id)
+        parsed = self._parser.parse(effective_query)
+        self._current_parsed = parsed
+        trace_id = uuid.uuid4().hex[:12]
+        stream_react_trace = _env_flag("STREAM_REACT_TRACE", True)
+        max_iterations = max(1, _env_int("REACT_MAX_ITERATIONS", 20))
+        tool_history: list[dict[str, Any]] = []
+
+        self._trace(
+            "query_start",
+            trace_id=trace_id,
+            mode="native_stream",
+            session_id=session_id,
+            user_query=user_query,
+            effective_query=effective_query,
+            used_conversation_memory=effective_query != user_query,
+            parsed_intent=parsed.intent,
+            parsed_filters=parsed.filters,
+            lifestyle_signals=parsed.lifestyle_signals,
+        )
+
+        prompt = (
+            f"Câu hỏi của người dùng: {effective_query}\n\n"
+            f"Intent đã phân tích: {parsed.intent}\n"
+            f"Bộ lọc đã phân tích: {json.dumps(parsed.filters, ensure_ascii=False)}\n"
+            f"Tín hiệu lifestyle: {', '.join(parsed.lifestyle_signals or []) or 'không có'}\n\n"
+            "Hãy dùng function calls để lấy dữ liệu cần thiết trước khi trả lời. "
+            "Nếu người dùng hỏi POI quanh một dự án/địa điểm cụ thể theo bán kính, dùng find_pois_near_location. "
+            "Nếu cần kiểm tra tiêu chí gần POI khi tìm tin đăng, dùng find_listings_near_pois hoặc find_nearby_pois. "
+            "Nếu cần tìm mô tả như ít ngập/yên tĩnh/gần trường học trong dữ liệu, dùng hybrid_search."
+        )
+        contents: list[Any] = [
+            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        ]
+        tools = self._native_tool_declarations()
+        final_answer = ""
+
+        for iteration in range(max_iterations):
+            response = self._llm.generate_with_tools(
+                contents=contents,
+                tools=tools,
+                system_prompt=self._native_agent_system_prompt(),
+                max_tokens=4096,
+                temperature=_chat_tool_temperature(),
+                tool_mode="AUTO",
+            )
+            if response is None:
+                self._trace(
+                    "native_llm_empty_response",
+                    trace_id=trace_id,
+                    mode="native_stream",
+                    iteration=iteration + 1,
+                )
+                break
+
+            function_calls = self._extract_native_function_calls(response)
+            response_text = self._native_response_text(response)
+            call_summaries = [
+                {"name": getattr(call, "name", ""), "args": self._native_call_args(call)}
+                for call in function_calls
+            ]
+            self._trace(
+                "native_llm_response",
+                trace_id=trace_id,
+                mode="native_stream",
+                iteration=iteration + 1,
+                response=response_text,
+                function_calls=call_summaries,
+            )
+
+            if function_calls:
+                try:
+                    contents.append(response.candidates[0].content)
+                except Exception:
+                    model_parts = [
+                        types.Part.from_function_call(
+                            name=str(getattr(call, "name", "")),
+                            args=self._native_call_args(call),
+                        )
+                        for call in function_calls
+                    ]
+                    contents.append(types.Content(role="model", parts=model_parts))
+
+                response_parts = []
+                for function_call in function_calls:
+                    tool_name = str(getattr(function_call, "name", ""))
+                    tool_args = self._native_call_args(function_call)
+                    args_json = json.dumps(tool_args, ensure_ascii=False)
+                    self._trace(
+                        "native_tool_call",
+                        trace_id=trace_id,
+                        mode="native_stream",
+                        iteration=iteration + 1,
+                        tool=tool_name,
+                        args=tool_args,
+                    )
+                    yield {"type": "status", "text": f"🔧 Đang tra cứu: {tool_name}..."}
+                    if stream_react_trace:
+                        yield {"type": "tool_call", "text": f"{tool_name}({args_json})"}
+
+                    observation = self._execute_tool_args(tool_name, tool_args)
+                    tool_history.append({"name": tool_name, "args": tool_args, "observation": observation[:1200]})
+                    self._trace(
+                        "native_tool_observation",
+                        trace_id=trace_id,
+                        mode="native_stream",
+                        iteration=iteration + 1,
+                        tool=tool_name,
+                        args=tool_args,
+                        observation=observation,
+                        source_count=len(self._agent_sources),
+                    )
+                    if stream_react_trace:
+                        yield {"type": "observation", "text": observation}
+
+                    response_parts.append(
+                        types.Part.from_function_response(
+                            name=tool_name,
+                            response={"result": observation},
+                        )
+                    )
+
+                contents.append(types.Content(role="user", parts=response_parts))
+                continue
+
+            if response_text and not _is_llm_failure_text(response_text):
+                accepted, gate_feedback = self._final_answer_gate(parsed, tool_history, response_text)
+                if accepted or iteration >= max_iterations - 1:
+                    final_answer = response_text
+                    self._trace(
+                        "native_final_answer_accepted",
+                        trace_id=trace_id,
+                        mode="native_stream",
+                        iteration=iteration + 1,
+                        accepted=accepted,
+                        forced_by_max_iteration=not accepted,
+                        answer=final_answer,
+                        source_count=len(self._agent_sources),
+                    )
+                    break
+
+                self._trace(
+                    "native_final_answer_rejected",
+                    trace_id=trace_id,
+                    mode="native_stream",
+                    iteration=iteration + 1,
+                    candidate_answer=response_text,
+                    gate_feedback=gate_feedback,
+                )
+                yield {"type": "status", "text": "🔎 Cần kiểm tra thêm tiêu chí còn thiếu..."}
+                try:
+                    contents.append(response.candidates[0].content)
+                except Exception:
+                    contents.append(types.Content(role="model", parts=[types.Part.from_text(text=response_text)]))
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(text=gate_feedback)]))
+                continue
+
+            break
+
+        unique_sources = self._unique_agent_sources()
+        yield {
+            "type": "metadata",
+            "intent": parsed.intent,
+            "filters": parsed.filters,
+            "effective_query": effective_query,
+            "used_conversation_memory": effective_query != user_query,
+            "sources": self._serialize_sources(unique_sources),
+        }
+
+        if not final_answer:
+            final_answer = self._synthesize_final_answer(
+                user_query=effective_query,
+                parsed=parsed,
+                draft="",
+            )
+        elif self._agent_sources and not self._should_ask_clarification_only(parsed, final_answer):
+            final_answer = self._synthesize_final_answer(
+                user_query=effective_query,
+                parsed=parsed,
+                draft=final_answer,
+            )
+
+        if self._should_ask_clarification_only(parsed, final_answer):
+            final_answer = self._format_clarification_only_answer(parsed)
+            self._trace(
+                "native_clarification_only",
+                trace_id=trace_id,
+                mode="native_stream",
+                session_id=session_id,
+                answer=final_answer,
+                source_count=len(self._agent_sources),
+            )
+
+        self._remember_or_clear_conversation(session_id, effective_query, parsed, final_answer)
+        self._trace(
+            "native_query_done",
+            trace_id=trace_id,
+            mode="native_stream",
+            session_id=session_id,
+            answer=final_answer,
+            source_count=len(self._agent_sources),
+        )
+        yield {"type": "status", "text": "✍️ Đang tạo câu trả lời..."}
+        yield {"type": "chunk", "text": final_answer}
+        yield {"type": "done"}
 
     def _final_answer_gate(
         self,
@@ -1237,11 +2088,33 @@ class RAGChain:
         has_hybrid = any(name in {"hybrid_search", "semantic_search", "keyword_search"} for name in tool_names)
         has_listing_filter = any(name in {"filter_listings", "find_listings_near_pois", "find_listings_near_metro"} for name in tool_names)
         has_poi_listing = any(name in {"find_listings_near_pois", "find_listings_near_metro"} for name in tool_names)
-        has_nearby_pois = any(name == "find_nearby_pois" for name in tool_names)
+        has_nearby_pois = any(name in {"find_nearby_pois", "find_pois_near_location"} for name in tool_names)
         has_web_depth = any(name in {"web_research", "read_url"} for name in tool_names)
         has_web = any(name in {"web_search", "web_research", "read_url"} for name in tool_names)
+        has_market_stats = any(name in {"get_market_statistics", "analyze_market_trend"} for name in tool_names)
 
-        if parsed.intent in {"search_listing", "lifestyle_search"} and not (has_hybrid or has_listing_filter):
+        if parsed.intent == "market_report":
+            if has_market_stats and self._agent_sources:
+                return True, ""
+            missing.append("chưa lấy số liệu thống kê thị trường")
+            suggestions.append("gọi `get_market_statistics` với khu vực và loại hình phù hợp")
+            detail = "; ".join(missing)
+            next_steps = "; ".join(dict.fromkeys(suggestions))
+            return False, f"{detail}. Bước tiếp theo: {next_steps}."
+
+        asks_only_pois_around_place = any(
+            token in query_norm
+            for token in ("xung quanh", "quanh", "ban kinh", "gan day")
+        ) and any(
+            token in query_norm
+            for token in ("truong", "benh vien", "cong vien", "tien ich", "poi")
+        )
+
+        if (
+            parsed.intent in {"search_listing", "lifestyle_search"}
+            and not asks_only_pois_around_place
+            and not (has_hybrid or has_listing_filter)
+        ):
             missing.append("chưa tìm tin đăng/dự án từ dữ liệu nội bộ")
             suggestions.append("gọi `hybrid_search` hoặc `filter_listings` trước")
 
@@ -1250,9 +2123,9 @@ class RAGChain:
             "tttm", "san bay", "landmark", "dia danh",
         }
         asks_near_location = "gan" in query_norm and any(word in query_norm for word in location_words)
-        if asks_near_location and not (has_poi_listing or "search_location" in tool_names):
+        if asks_near_location and not (has_poi_listing or has_nearby_pois or "search_location" in tool_names):
             missing.append("chưa xử lý tiêu chí gần địa điểm/POI")
-            suggestions.append("gọi `find_listings_near_pois` cho POI/category phù hợp hoặc `search_location` nếu là địa danh cụ thể")
+            suggestions.append("gọi `find_pois_near_location` nếu hỏi POI quanh địa điểm/dự án, hoặc `find_listings_near_pois` nếu đang tìm tin đăng")
 
         wants_metro = "metro" in signals or "metro" in query_norm or "tau dien" in query_norm
         if wants_metro and not (
@@ -1270,7 +2143,7 @@ class RAGChain:
             or "truong" in source_text
         ):
             missing.append("chưa kiểm tra trường học gần ứng viên")
-            suggestions.append("gọi `find_nearby_pois` với categories=[\"school\"] cho các source_record_id tốt")
+            suggestions.append("gọi `find_pois_near_location` cho địa điểm/dự án, hoặc `find_nearby_pois` với categories=[\"school\"] cho các source_record_id tốt")
 
         wants_flood = "flood" in signals or "ngap" in query_norm
         if wants_flood and not (
@@ -1428,7 +2301,11 @@ class RAGChain:
         )
         sparse_constraints = not parsed.filters.get("tinh_thanh") and not parsed.filters.get("loai_hinh")
         answer_is_clarification = self._is_clarification_answer_allowed(parsed, draft)
-        return bool(answer_is_clarification or (broad_location_sensitive and sparse_constraints))
+        has_sourced_evidence = bool(self._agent_sources) or bool(re.search(r"https?://|hf://", draft or ""))
+        return bool(
+            answer_is_clarification
+            or (broad_location_sensitive and sparse_constraints and not has_sourced_evidence)
+        )
 
     def _format_clarification_only_answer(self, parsed: ParsedQuery) -> str:
         questions = self._clarification_questions(parsed)
@@ -1476,33 +2353,66 @@ class RAGChain:
             prompt=prompt,
             system_prompt=SYSTEM_PROMPT,
             max_tokens=4096,
-            temperature=0.2,
+            temperature=_chat_answer_temperature(),
         )
         return answer.strip() if answer else (draft.strip() or "Tôi chưa có đủ thông tin để trả lời chính xác.")
 
     # ---------------------------------------------------------------------------
     # ReAct Agent loop implementation
     # ---------------------------------------------------------------------------
-    def query(self, user_query: str, top_k: int = 5) -> RAGResponse:
+    def query(self, user_query: str, top_k: int = 5, session_id: Optional[str] = None) -> RAGResponse:
         """Process a user query through the agentic RAG loop."""
         log.info(f"Processing query: {user_query[:80]}...")
+
+        if self._use_native_function_calling():
+            answer_parts: list[str] = []
+            metadata: dict[str, Any] = {}
+            for event in self._query_stream_native_gemini(user_query, top_k=top_k, session_id=session_id):
+                if event.get("type") == "chunk":
+                    answer_parts.append(event.get("text", ""))
+                elif event.get("type") == "metadata":
+                    metadata = event
+            parsed = self._current_parsed or self._parser.parse(metadata.get("effective_query") or user_query)
+            return RAGResponse(
+                answer="".join(answer_parts),
+                sources=self._unique_agent_sources(),
+                intent=parsed.intent,
+                filters_applied=parsed.filters,
+                parsed_query=parsed,
+                llm_used=True,
+                effective_query=metadata.get("effective_query") or user_query,
+            )
         
         # Reset retrieved sources cache
         self._agent_sources = []
+        effective_query = self._prepare_query_for_session(user_query, session_id)
+        trace_id = uuid.uuid4().hex[:12]
         
         # Step 1: Parse query for initial fallback/metadata tracking
-        parsed = self._parser.parse(user_query)
+        parsed = self._parser.parse(effective_query)
         self._current_parsed = parsed
+        self._trace(
+            "query_start",
+            trace_id=trace_id,
+            mode="query",
+            session_id=session_id,
+            user_query=user_query,
+            effective_query=effective_query,
+            used_conversation_memory=effective_query != user_query,
+            parsed_intent=parsed.intent,
+            parsed_filters=parsed.filters,
+            lifestyle_signals=parsed.lifestyle_signals,
+        )
 
         # Step 2: System prompt setup
         from rag.prompts import REACT_SYSTEM_PROMPT, SYSTEM_PROMPT
         agent_prompt = (
             f"{REACT_SYSTEM_PROMPT}\n\n"
-            f"User Query: {user_query}\n\n"
+            f"User Query: {effective_query}\n\n"
             "Hãy bắt đầu với Thought: đầu tiên của bạn."
         )
 
-        MAX_ITERATIONS = 20
+        MAX_ITERATIONS = max(1, _env_int("REACT_MAX_ITERATIONS", 20))
         llm_used = False
         answer = ""
         tool_history: list[dict[str, Any]] = []
@@ -1514,13 +2424,20 @@ class RAGChain:
                 response = self._llm.generate(
                     prompt=agent_prompt,
                     system_prompt=SYSTEM_PROMPT,
-                    temperature=0.1
+                    temperature=_chat_tool_temperature()
+                )
+                self._trace(
+                    "llm_response",
+                    trace_id=trace_id,
+                    mode="query",
+                    iteration=iteration + 1,
+                    response=response or "",
                 )
                 if not response:
                     log.warning("Received empty response from LLM")
                     break
 
-                log.info(f"LLM Response:\n{response}")
+                log.info("LLM response received (chars=%s)", len(response))
 
                 if "Final Answer:" in response:
                     parts = response.split("Final Answer:", 1)
@@ -1528,61 +2445,127 @@ class RAGChain:
                     accepted, gate_feedback = self._final_answer_gate(parsed, tool_history, candidate_answer)
                     if accepted or iteration >= MAX_ITERATIONS - 1:
                         answer = candidate_answer
+                        self._trace(
+                            "final_answer_accepted",
+                            trace_id=trace_id,
+                            mode="query",
+                            iteration=iteration + 1,
+                            accepted=accepted,
+                            forced_by_max_iteration=not accepted,
+                            answer=answer,
+                        )
                         log.info("Found accepted Final Answer. Exiting loop.")
                         break
                     log.info("Final Answer rejected by coverage gate: %s", gate_feedback)
+                    self._trace(
+                        "final_answer_rejected",
+                        trace_id=trace_id,
+                        mode="query",
+                        iteration=iteration + 1,
+                        candidate_answer=candidate_answer,
+                        gate_feedback=gate_feedback,
+                    )
                     agent_prompt += f"\n{response}\nObservation: {gate_feedback}\n"
                     continue
 
                 # Parse Action
-                action_match = re.search(r"Action:\s*`?(\w+)`?", response, re.IGNORECASE)
-                if action_match:
-                    tool_name = action_match.group(1).strip()
-                    remaining = response[action_match.end():].strip()
-                    brace_start = remaining.find("{")
-                    brace_end = remaining.rfind("}")
-                    
-                    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
-                        tool_args_str = remaining[brace_start:brace_end+1]
+                tool_name, tool_args_str = _parse_action_call(response)
+                if tool_name:
+                    if tool_args_str:
                         log.info(f"Executing tool {tool_name} with arguments: {tool_args_str}")
+                        self._trace(
+                            "tool_call",
+                            trace_id=trace_id,
+                            mode="query",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                            args_raw=tool_args_str,
+                        )
                         observation = self._execute_tool(tool_name, tool_args_str)
                         try:
                             tool_args = json.loads(tool_args_str)
                         except Exception:
                             tool_args = {}
                         tool_history.append({"name": tool_name, "args": tool_args, "observation": observation[:1200]})
-                        log.info(f"Observation: {observation}")
+                        log.info("Tool observation received from %s (chars=%s)", tool_name, len(observation))
+                        self._trace(
+                            "tool_observation",
+                            trace_id=trace_id,
+                            mode="query",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                            args=tool_args,
+                            observation=observation,
+                            source_count=len(self._agent_sources),
+                        )
                         agent_prompt += f"\n{response}\nObservation: {observation}\n"
                         continue
                     else:
                         observation = "Lỗi: Tham số không đúng định dạng JSON. Vui lòng định dạng dưới dạng: Action: tool_name({\"key\": \"value\"})"
-                        log.warning(f"Malformed tool call JSON. LLM output: {response}")
+                        log.warning("Malformed tool call JSON from LLM output (chars=%s)", len(response))
+                        self._trace(
+                            "tool_parse_error",
+                            trace_id=trace_id,
+                            mode="query",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                            response=response,
+                            observation=observation,
+                        )
                         agent_prompt += f"\n{response}\nObservation: {observation}\n"
                         continue
 
                 # Fallback if loop gets stuck
                 log.warning("No clear Action or Final Answer. Fallback to response text.")
+                draft = "" if _is_llm_failure_text(response) else response.replace("Thought:", "").strip()
                 answer = self._synthesize_final_answer(
-                    user_query=user_query,
+                    user_query=effective_query,
                     parsed=parsed,
-                    draft=response.replace("Thought:", "").strip(),
+                    draft=draft,
+                )
+                self._trace(
+                    "fallback_synthesis",
+                    trace_id=trace_id,
+                    mode="query",
+                    iteration=iteration + 1,
+                    draft=draft,
+                    answer=answer,
+                    source_count=len(self._agent_sources),
                 )
                 break
             else:
                 log.warning("Exceeded max iterations")
                 answer = self._synthesize_final_answer(
-                    user_query=user_query,
+                    user_query=effective_query,
                     parsed=parsed,
                     draft="Đã vượt quá giới hạn vòng ReAct trước khi có Final Answer.",
+                )
+                self._trace(
+                    "max_iterations_synthesis",
+                    trace_id=trace_id,
+                    mode="query",
+                    max_iterations=MAX_ITERATIONS,
+                    answer=answer,
+                    source_count=len(self._agent_sources),
                 )
         else:
             # Fallback to local format if LLM is offline
             from rag.llm import LLMClient
             answer = LLMClient.format_without_llm(
-                query=user_query,
+                query=effective_query,
                 documents=[],
                 intent=parsed.intent
             )
+
+        self._remember_or_clear_conversation(session_id, effective_query, parsed, answer)
+        self._trace(
+            "query_done",
+            trace_id=trace_id,
+            mode="query",
+            session_id=session_id,
+            answer=answer,
+            source_count=len(self._agent_sources),
+        )
 
         # De-duplicate collected sources
         seen_urls = set()
@@ -1603,28 +2586,49 @@ class RAGChain:
             filters_applied=parsed.filters,
             parsed_query=parsed,
             llm_used=llm_used,
+            effective_query=effective_query,
         )
 
     def query_stream(
         self,
         user_query: str,
         top_k: int = 5,
+        session_id: Optional[str] = None,
     ) -> Iterator[dict]:
         """Process a user query: run ReAct loop silently, then stream the final answer."""
         log.info(f"Streaming query: {user_query[:80]}...")
 
+        if self._use_native_function_calling():
+            yield from self._query_stream_native_gemini(user_query, top_k=top_k, session_id=session_id)
+            return
+
         self._agent_sources = []
-        parsed = self._parser.parse(user_query)
+        effective_query = self._prepare_query_for_session(user_query, session_id)
+        parsed = self._parser.parse(effective_query)
         self._current_parsed = parsed
+        trace_id = uuid.uuid4().hex[:12]
+        stream_react_trace = _env_flag("STREAM_REACT_TRACE", True)
+        self._trace(
+            "query_start",
+            trace_id=trace_id,
+            mode="stream",
+            session_id=session_id,
+            user_query=user_query,
+            effective_query=effective_query,
+            used_conversation_memory=effective_query != user_query,
+            parsed_intent=parsed.intent,
+            parsed_filters=parsed.filters,
+            lifestyle_signals=parsed.lifestyle_signals,
+        )
 
         from rag.prompts import REACT_SYSTEM_PROMPT, SYSTEM_PROMPT
         agent_prompt = (
             f"{REACT_SYSTEM_PROMPT}\n\n"
-            f"User Query: {user_query}\n\n"
+            f"User Query: {effective_query}\n\n"
             "Hãy bắt đầu với Thought: đầu tiên của bạn."
         )
 
-        MAX_ITERATIONS = 8
+        MAX_ITERATIONS = max(1, _env_int("REACT_MAX_ITERATIONS", 20))
 
         if self._llm.is_available:
             # ── Phase 1: Run the full ReAct loop silently ──────────────────────
@@ -1636,34 +2640,61 @@ class RAGChain:
                 response = self._llm.generate(
                     prompt=agent_prompt,
                     system_prompt=SYSTEM_PROMPT,
-                    temperature=0.1
+                    temperature=_chat_tool_temperature()
+                )
+                self._trace(
+                    "llm_response",
+                    trace_id=trace_id,
+                    mode="stream",
+                    iteration=iteration + 1,
+                    response=response or "",
                 )
                 if not response:
                     break
                     
-                log.info(f"LLM Response in Stream:\n{response}")
-                yield {"type": "thought", "text": response}
+                log.info("LLM response received in stream loop (chars=%s)", len(response))
+                if stream_react_trace:
+                    yield {"type": "thought", "text": response}
 
                 if "Final Answer:" in response:
                     candidate_final = response.split("Final Answer:", 1)[1].strip()
                     accepted, gate_feedback = self._final_answer_gate(parsed, tool_history, candidate_final)
                     if accepted or iteration >= MAX_ITERATIONS - 1:
                         raw_final = candidate_final
+                        self._trace(
+                            "final_answer_accepted",
+                            trace_id=trace_id,
+                            mode="stream",
+                            iteration=iteration + 1,
+                            accepted=accepted,
+                            forced_by_max_iteration=not accepted,
+                            answer=raw_final,
+                        )
                         break
+                    self._trace(
+                        "final_answer_rejected",
+                        trace_id=trace_id,
+                        mode="stream",
+                        iteration=iteration + 1,
+                        candidate_answer=candidate_final,
+                        gate_feedback=gate_feedback,
+                    )
                     yield {"type": "status", "text": "🔎 Cần kiểm tra thêm tiêu chí còn thiếu..."}
                     agent_prompt += f"\n{response}\nObservation: {gate_feedback}\n"
                     continue
 
                 # Execute tool call
-                action_match = re.search(r"Action:\s*`?(\w+)`?", response, re.IGNORECASE)
-                if action_match:
-                    tool_name = action_match.group(1).strip()
-                    remaining = response[action_match.end():].strip()
-                    brace_start = remaining.find("{")
-                    brace_end = remaining.rfind("}")
-
-                    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
-                        tool_args_str = remaining[brace_start:brace_end+1]
+                tool_name, tool_args_str = _parse_action_call(response)
+                if tool_name:
+                    if tool_args_str:
+                        self._trace(
+                            "tool_call",
+                            trace_id=trace_id,
+                            mode="stream",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                            args_raw=tool_args_str,
+                        )
 
                         # Brief status — user knows the agent is working
                         yield {"type": "status", "text": f"🔧 Đang tra cứu: {tool_name}..."}
@@ -1674,18 +2705,47 @@ class RAGChain:
                         except Exception:
                             tool_args = {}
                         tool_history.append({"name": tool_name, "args": tool_args, "observation": observation[:1200]})
-                        yield {"type": "observation", "text": f"Observation: {observation}"}
+                        self._trace(
+                            "tool_observation",
+                            trace_id=trace_id,
+                            mode="stream",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                            args=tool_args,
+                            observation=observation,
+                            source_count=len(self._agent_sources),
+                        )
+                        if stream_react_trace:
+                            yield {"type": "observation", "text": f"Observation: {observation}"}
                         agent_prompt += f"\n{response}\nObservation: {observation}\n"
                         continue
                     else:
                         observation = "Lỗi: Tham số không đúng định dạng JSON. Vui lòng định dạng dưới dạng: Action: tool_name({\"key\": \"value\"})"
-                        log.warning(f"Malformed tool call JSON. LLM output: {response}")
-                        yield {"type": "observation", "text": f"Observation: {observation}"}
+                        log.warning("Malformed tool call JSON from streamed LLM output (chars=%s)", len(response))
+                        self._trace(
+                            "tool_parse_error",
+                            trace_id=trace_id,
+                            mode="stream",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                            response=response,
+                            observation=observation,
+                        )
+                        if stream_react_trace:
+                            yield {"type": "observation", "text": f"Observation: {observation}"}
                         agent_prompt += f"\n{response}\nObservation: {observation}\n"
                         continue
 
                 # No Action and no Final Answer — treat as the answer
-                raw_final = response.replace("Thought:", "").strip()
+                raw_final = "" if _is_llm_failure_text(response) else response.replace("Thought:", "").strip()
+                self._trace(
+                    "fallback_raw_final",
+                    trace_id=trace_id,
+                    mode="stream",
+                    iteration=iteration + 1,
+                    raw_final=raw_final,
+                    source_count=len(self._agent_sources),
+                )
                 break
 
             # ── Phase 2: Emit sources metadata ─────────────────────────────────
@@ -1715,20 +2775,35 @@ class RAGChain:
                 "type": "metadata",
                 "intent": parsed.intent,
                 "filters": parsed.filters,
+                "effective_query": effective_query,
+                "used_conversation_memory": effective_query != user_query,
                 "sources": serialized_sources,
             }
 
             if self._should_ask_clarification_only(parsed, raw_final):
+                clarification_answer = self._format_clarification_only_answer(parsed)
+                self._remember_or_clear_conversation(session_id, effective_query, parsed, clarification_answer)
+                self._trace(
+                    "clarification_only",
+                    trace_id=trace_id,
+                    mode="stream",
+                    session_id=session_id,
+                    raw_final=raw_final,
+                    answer=clarification_answer,
+                    source_count=len(self._agent_sources),
+                )
                 yield {"type": "status", "text": "✍️ Đang tạo câu hỏi làm rõ..."}
-                yield {"type": "chunk", "text": self._format_clarification_only_answer(parsed)}
+                yield {"type": "chunk", "text": clarification_answer}
                 yield {"type": "done"}
                 return
+
+            self._remember_or_clear_conversation(session_id, effective_query, parsed, raw_final)
 
             # ── Phase 3: Stream the final answer ───────────────────────────────
             # Clean prompt — user query + retrieved source context + raw draft.
             retrieved_context = format_context(self._agent_sources, max_chars=12000)
             stream_prompt = (
-                f"Câu hỏi của người dùng: {user_query}\n\n"
+                f"Câu hỏi của người dùng: {effective_query}\n\n"
                 f"Thông tin đã tra cứu từ công cụ:\n{retrieved_context}\n\n"
                 f"Ghi chú/draft từ vòng ReAct:\n{raw_final}\n\n"
                 "Dựa trên thông tin trên, hãy viết câu trả lời hoàn chỉnh dưới "
@@ -1737,23 +2812,42 @@ class RAGChain:
             )
 
             yield {"type": "status", "text": "✍️ Đang tạo câu trả lời..."}
+            streamed_answer_parts: list[str] = []
             for token in self._llm.generate_stream(
                 prompt=stream_prompt,
                 system_prompt=SYSTEM_PROMPT,
                 max_tokens=4096,
-                temperature=0.3,
+                temperature=_chat_answer_temperature(),
             ):
+                streamed_answer_parts.append(token)
                 yield {"type": "chunk", "text": token}
 
+            streamed_answer = "".join(streamed_answer_parts)
+            self._trace(
+                "final_stream_done",
+                trace_id=trace_id,
+                mode="stream",
+                session_id=session_id,
+                raw_final=raw_final,
+                answer=streamed_answer,
+                source_count=len(self._agent_sources),
+            )
             yield {"type": "done"}
 
         else:
             # Fallback for offline LLM
             from rag.llm import LLMClient
             fallback_text = LLMClient.format_without_llm(
-                query=user_query,
+                query=effective_query,
                 documents=[],
                 intent=parsed.intent
+            )
+            self._trace(
+                "offline_fallback",
+                trace_id=trace_id,
+                mode="stream",
+                session_id=session_id,
+                answer=fallback_text,
             )
             yield {
                 "type": "metadata",

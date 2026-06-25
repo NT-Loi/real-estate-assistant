@@ -1167,6 +1167,10 @@
     border-left: 3px solid hsl(var(--primary-raw));
   }
 
+  .think-step.tool_call pre {
+    border-left: 3px solid hsl(var(--accent-raw));
+  }
+
   /* RAG Source Cards */
   .sources-carousel {
     display: flex;

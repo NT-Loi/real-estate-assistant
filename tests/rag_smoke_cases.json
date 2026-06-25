@@ -1,0 +1,26 @@
+[
+  {
+    "id": "clarify_broad_lifestyle",
+    "query": "tìm chung cư gần metro, ít ngập nước, gần trường học",
+    "min_answer_chars": 120,
+    "min_sources": 0,
+    "answer_keywords_any": ["mua", "thuê", "thành phố", "khu vực", "ngân sách"],
+    "tools_any": []
+  },
+  {
+    "id": "rent_hcm_budget_metro",
+    "query": "tôi muốn thuê căn hộ chung cư ở TP Hồ Chí Minh dưới 15 triệu gần metro",
+    "min_answer_chars": 120,
+    "min_sources": 0,
+    "answer_keywords_any": ["thuê", "15 triệu", "metro", "Hồ Chí Minh", "căn hộ"],
+    "tools_any": ["filter_listings", "hybrid_search", "find_listings_near_pois"]
+  },
+  {
+    "id": "market_stats_hcm_apartment",
+    "query": "thống kê thị trường căn hộ chung cư Quận 2 TP Hồ Chí Minh",
+    "min_answer_chars": 80,
+    "min_sources": 0,
+    "answer_keywords_any": ["Quận 2", "Hồ Chí Minh", "giá", "thị trường", "căn hộ"],
+    "tools_any": ["get_market_statistics", "analyze_market_trend", "hybrid_search"]
+  }
+]

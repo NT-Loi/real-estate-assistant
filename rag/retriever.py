@@ -21,10 +21,11 @@ def _format_market_row(row: dict) -> str:
     """Format a market_snapshots row as readable Vietnamese text for LLM context."""
     listing_label = {
         "ban": "Nhà bán",
+        "cho-thue": "Nhà cho thuê",
         "cho_thue": "Nhà cho thuê",
     }.get(row.get("listing_type", ""), row.get("listing_type", ""))
 
-    loc_parts = [p for p in [row.get("district"), row.get("province")] if p]
+    loc_parts = [p for p in [row.get("ward"), row.get("district"), row.get("province")] if p]
     location = ", ".join(loc_parts) or "Toàn quốc"
     prop_type = row.get("property_type") or "Tất cả loại"
     period = row.get("period", "")
@@ -275,11 +276,13 @@ class Retriever:
         province = f.get("tinh_thanh")
         district = f.get("quan_huyen")
         property_type = f.get("loai_nha_dat")
+        listing_type = f.get("loai_hinh")
 
         try:
             rows = self._store.pg.fetch_market_stats(
                 province=province,
                 district=district,
+                listing_type=listing_type,
                 property_type=property_type,
                 months=months,
             )

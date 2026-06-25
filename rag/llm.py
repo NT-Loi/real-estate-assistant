@@ -16,7 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 # Load .env from project root (graceful — dotenv is optional)
 try:
@@ -121,6 +121,77 @@ class LLMClient:
     def is_available(self) -> bool:
         """Whether the LLM is available for generation."""
         return self._available
+
+    @property
+    def supports_native_tools(self) -> bool:
+        """Whether the configured provider can return native function calls."""
+        return self._available and self._provider in {"gemini", "vertexai"} and self._client is not None
+
+    def generate_with_tools(
+        self,
+        contents: Any,
+        tools: list[Any],
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        tool_mode: str = "AUTO",
+    ) -> Any:
+        """Generate with Gemini/Vertex native function declarations and return the raw SDK response."""
+        if not self.supports_native_tools:
+            return None
+
+        import time
+        try:
+            from google.genai import types
+        except ImportError:
+            return None
+
+        try:
+            mode = getattr(types.FunctionCallingConfigMode, tool_mode.upper(), types.FunctionCallingConfigMode.AUTO)
+            tool_config = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode=mode)
+            )
+        except Exception:
+            tool_config = None
+
+        config = types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+            system_instruction=system_prompt or "",
+            tools=tools,
+            tool_config=tool_config,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+
+        models_to_try = [self._model_name]
+        if self._model_name not in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
+            models_to_try.append("gemini-2.0-flash")
+
+        last_error = None
+        for model in models_to_try:
+            for attempt in range(3):
+                try:
+                    return self._client.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=config,
+                    )
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        last_error = e
+                        if attempt == 0:
+                            log.warning(f"Rate limited on native tool call {model}, waiting 1s…")
+                            time.sleep(1)
+                        else:
+                            log.warning(f"Rate limited on native tool call {model}, trying fallback model…")
+                        continue
+                    log.error(f"Native tool generation error [{model}]: {e}")
+                    last_error = e
+                    break
+
+        log.error(f"All native tool models exhausted. Last error: {last_error}")
+        return None
 
     def generate(
         self,
@@ -347,12 +418,13 @@ class LLMClient:
                     for chunk in stream:
                         # Iterate parts directly to skip thought tokens
                         try:
-                            parts = chunk.candidates[0].content.parts
+                            parts = chunk.candidates[0].content.parts or []
                             for part in parts:
                                 if getattr(part, "thought", False):
                                     continue  # skip thinking tokens
-                                if part.text:
-                                    yield part.text
+                                text = getattr(part, "text", None)
+                                if text:
+                                    yield text
                         except (IndexError, AttributeError):
                             # Fallback if structure differs
                             if chunk.text:
@@ -376,20 +448,34 @@ class LLMClient:
         only the final answer text.
         """
         try:
-            parts = response.candidates[0].content.parts
+            parts = response.candidates[0].content.parts or []
             texts = [
-                part.text
+                getattr(part, "text", "")
                 for part in parts
-                if not getattr(part, "thought", False) and part.text
+                if not getattr(part, "thought", False) and getattr(part, "text", None)
             ]
-            joined = "".join(texts)
-            raw_text = getattr(response, "text", "") or ""
-            if raw_text and len(raw_text) > len(joined):
-                return raw_text
-            return joined
-        except (IndexError, AttributeError):
-            # Fallback: use response.text which may include thought tokens
-            return response.text or ""
+            if texts:
+                return "".join(texts)
+
+            # Function-call-only responses intentionally have no text. Avoid
+            # touching response.text here because google-genai warns when
+            # non-text parts such as function_call are present.
+            if any(
+                getattr(part, "function_call", None)
+                or getattr(part, "tool_call", None)
+                or getattr(part, "function_response", None)
+                or getattr(part, "tool_response", None)
+                for part in parts
+            ):
+                return ""
+        except (IndexError, AttributeError, TypeError):
+            pass
+
+        # Fallback for older/different SDK response shapes.
+        try:
+            return getattr(response, "text", "") or ""
+        except Exception:
+            return ""
 
     @staticmethod
     def format_without_llm(

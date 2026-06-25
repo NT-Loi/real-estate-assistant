@@ -29,8 +29,10 @@ if str(ROOT) not in sys.path:
 RAG_CHAIN = None
 RAG_INIT_ERROR = None
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from utils.logging_config import configure_system_logging
+
+# Configure logging to console and logs/system.log.
+configure_system_logging()
 log = logging.getLogger("bds_server")
 
 CITY_COORDS = {
@@ -220,7 +222,8 @@ async def lifespan(app: FastAPI):
     Eagerly initialize all heavy resources at server startup:
       1. RAGChain (triggers VectorStore → Qdrant + PostgreSQL connections)
       2. Embedding model (SentenceTransformer warm-up)
-      3. LLM client (Ollama/Gemini availability check)
+      3. Reranker model warm-up
+      4. LLM client (Ollama/Gemini availability check)
     """
     global RAG_CHAIN, RAG_INIT_ERROR
     t0 = time.monotonic()
@@ -228,23 +231,73 @@ async def lifespan(app: FastAPI):
     log.info("  Starting RAG Real-Estate Assistant — loading all components…")
     log.info("="*60)
 
-    # ── 1. RAGChain (includes VectorStore + embedding model + PostgreSQL) ──
+    # ── 1. RAGChain (includes VectorStore + Qdrant + PostgreSQL) ───────────
     try:
-        log.info("[1/3] Initializing RAGChain (Qdrant + PostgreSQL + embedding model)…")
+        log.info("[1/4] Initializing RAGChain (Qdrant + PostgreSQL)…")
         loop = asyncio.get_event_loop()
         from rag.chain import RAGChain
         RAG_CHAIN = await loop.run_in_executor(None, RAGChain)
         STARTUP_STATUS["rag_chain"] = "ok"
-        log.info("[1/3] ✓ RAGChain ready")
+        log.info("[1/4] ✓ RAGChain ready")
     except Exception as exc:
         RAG_INIT_ERROR = exc
         STARTUP_STATUS["rag_chain"] = f"error: {exc}"
-        log.error(f"[1/3] ✗ RAGChain failed: {exc}")
+        log.error(f"[1/4] ✗ RAGChain failed: {exc}")
         log.warning("      Chat will fall back to local listing search.")
 
-    # ── 2. LLM warm-up ping ─────────────────────────────────────────────────
+    # ── 2. Embedding model warm-up ──────────────────────────────────────────
     try:
-        log.info("[2/3] Warming up LLM client…")
+        log.info("[2/4] Loading embedding model…")
+        if RAG_CHAIN is not None:
+            embedder = getattr(getattr(RAG_CHAIN, "_store", None), "_embedder", None)
+            if embedder is not None and hasattr(embedder, "_load"):
+                loop = asyncio.get_event_loop()
+                model = await loop.run_in_executor(None, embedder._load)
+                dimension = model.get_embedding_dimension() if hasattr(model, "get_embedding_dimension") else "unknown"
+                STARTUP_STATUS["embedding"] = f"ok (dim={dimension})"
+                log.info(f"[2/4] ✓ Embedding model ready (dim={dimension})")
+            else:
+                STARTUP_STATUS["embedding"] = "skipped (embedder not found)"
+                log.info("[2/4] - Embedding check skipped (embedder not found)")
+        else:
+            STARTUP_STATUS["embedding"] = "skipped (RAGChain not loaded)"
+            log.info("[2/4] - Embedding check skipped (RAGChain not loaded)")
+    except Exception as exc:
+        STARTUP_STATUS["embedding"] = f"error: {exc}"
+        log.error(f"[2/4] ✗ Embedding warm-up error: {exc}")
+
+    # ── 3. Reranker model warm-up ───────────────────────────────────────────
+    try:
+        log.info("[3/4] Loading reranker model…")
+        if RAG_CHAIN is not None:
+            reranker = getattr(getattr(RAG_CHAIN, "_retriever", None), "_reranker", None)
+            if reranker is None:
+                STARTUP_STATUS["reranker"] = "disabled"
+                log.info("[3/4] - Reranker disabled")
+            elif hasattr(reranker, "_load"):
+                loop = asyncio.get_event_loop()
+                loaded = await loop.run_in_executor(None, reranker._load)
+                model_name = getattr(reranker, "_model_name", "unknown")
+                device = getattr(reranker, "_device", "unknown")
+                if loaded:
+                    STARTUP_STATUS["reranker"] = f"ok ({model_name}, device={device})"
+                    log.info(f"[3/4] ✓ Reranker ready ({model_name}, device={device})")
+                else:
+                    STARTUP_STATUS["reranker"] = "disabled (load failed)"
+                    log.warning("[3/4] ⚠ Reranker disabled (load failed)")
+            else:
+                STARTUP_STATUS["reranker"] = "skipped (reranker has no loader)"
+                log.info("[3/4] - Reranker check skipped (no loader)")
+        else:
+            STARTUP_STATUS["reranker"] = "skipped (RAGChain not loaded)"
+            log.info("[3/4] - Reranker check skipped (RAGChain not loaded)")
+    except Exception as exc:
+        STARTUP_STATUS["reranker"] = f"error: {exc}"
+        log.error(f"[3/4] ✗ Reranker warm-up error: {exc}")
+
+    # ── 4. LLM warm-up ping ─────────────────────────────────────────────────
+    try:
+        log.info("[4/4] Warming up LLM client…")
         if RAG_CHAIN is not None:
             llm = RAG_CHAIN._llm
             provider = getattr(llm, "_provider", "unknown")
@@ -255,24 +308,26 @@ async def lifespan(app: FastAPI):
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, lambda: llm.generate("hi", max_tokens=1, temperature=0.0))
                 STARTUP_STATUS["llm"] = f"ok ({provider}: {model})"
-                log.info(f"[2/3] ✓ LLM ready ({provider}: {model})")
+                log.info(f"[4/4] ✓ LLM ready ({provider}: {model})")
             else:
                 STARTUP_STATUS["llm"] = "unavailable (no API key or connection)"
-                log.warning(f"[2/3] ⚠ LLM unavailable — using formatted fallback")
+                log.warning(f"[4/4] ⚠ LLM unavailable — using formatted fallback")
         else:
             STARTUP_STATUS["llm"] = "skipped (RAGChain not loaded)"
-            log.info("[2/3] - LLM check skipped (RAGChain not loaded)")
+            log.info("[4/4] - LLM check skipped (RAGChain not loaded)")
     except Exception as exc:
         STARTUP_STATUS["llm"] = f"error: {exc}"
-        log.error(f"[2/3] ✗ LLM warm-up error: {exc}")
+        log.error(f"[4/4] ✗ LLM warm-up error: {exc}")
 
-    # ── 3. Summary ──────────────────────────────────────────────────────────
+    # ── Summary ─────────────────────────────────────────────────────────────
     elapsed = time.monotonic() - t0
     STARTUP_STATUS["startup_seconds"] = round(elapsed, 2)
     log.info("="*60)
     log.info(f"  All components loaded in {elapsed:.1f}s — server ready!")
-    log.info(f"  RAG:  {STARTUP_STATUS.get('rag_chain', '?')}")
-    log.info(f"  LLM:  {STARTUP_STATUS.get('llm', '?')}")
+    log.info(f"  RAG:       {STARTUP_STATUS.get('rag_chain', '?')}")
+    log.info(f"  Embedding: {STARTUP_STATUS.get('embedding', '?')}")
+    log.info(f"  Reranker:  {STARTUP_STATUS.get('reranker', '?')}")
+    log.info(f"  LLM:       {STARTUP_STATUS.get('llm', '?')}")
     log.info("="*60)
 
     yield  # ← server runs here
@@ -388,6 +443,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: Optional[str] = None
 
 @app.get("/api/status")
 def get_status():
@@ -395,6 +451,8 @@ def get_status():
     return {
         "status": "ok" if RAG_CHAIN is not None else "degraded",
         "rag_chain": STARTUP_STATUS.get("rag_chain", "not started"),
+        "embedding": STARTUP_STATUS.get("embedding", "not started"),
+        "reranker": STARTUP_STATUS.get("reranker", "not started"),
         "llm": STARTUP_STATUS.get("llm", "not started"),
         "startup_seconds": STARTUP_STATUS.get("startup_seconds"),
         "listings_loaded": len(LISTINGS),
@@ -498,6 +556,7 @@ def chat(payload: ChatRequest):
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
+    session_id = payload.session_id or "default"
 
     def sse_stream():
         """Generator that yields SSE-formatted events."""
@@ -505,7 +564,7 @@ def chat(payload: ChatRequest):
             chain = get_rag_chain()
             mapped_listings = None
 
-            for event in chain.query_stream(message):
+            for event in chain.query_stream(message, session_id=session_id):
                 etype = event.get("type")
 
                 if etype == "metadata":
@@ -521,10 +580,15 @@ def chat(payload: ChatRequest):
                     }
                     yield f"event: metadata\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
 
-                elif etype in ["thought", "observation"]:
+                elif etype in ["thought", "tool_call", "observation"]:
                     text = event.get("text", "")
                     if text:
                         yield f"event: {etype}\ndata: {json.dumps(text, ensure_ascii=False)}\n\n"
+
+                elif etype == "status":
+                    text = event.get("text", "")
+                    if text:
+                        yield f"event: status\ndata: {json.dumps(text, ensure_ascii=False)}\n\n"
 
                 elif etype == "chunk":
                     text = event.get("text", "")
