@@ -46,6 +46,21 @@ RERANKER_CANDIDATES = 60
 RERANKER_KEEP = 10
 
 # ---------------------------------------------------------------------------
+# Retrieval
+# ---------------------------------------------------------------------------
+# Keep chunk-level evidence by default. Turning this on keeps only the best
+# chunk per source record, which can hide useful context from long listings,
+# articles, or social threads.
+RETRIEVAL_COLLAPSE_BY_SOURCE = os.getenv("RETRIEVAL_COLLAPSE_BY_SOURCE", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RETRIEVAL_MIN_SEMANTIC_LIMIT = int(os.getenv("RETRIEVAL_MIN_SEMANTIC_LIMIT", "10"))
+RETRIEVAL_MIN_HYBRID_LIMIT = int(os.getenv("RETRIEVAL_MIN_HYBRID_LIMIT", "12"))
+
+# ---------------------------------------------------------------------------
 # Qdrant collection names
 # ---------------------------------------------------------------------------
 COLLECTION_LISTINGS = "listings"

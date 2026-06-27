@@ -48,7 +48,7 @@ _INTENT_TO_COLLECTIONS: dict[str, list[str]] = {
     "compare_project":   ["projects", "listings"],
     "ask_knowledge":     ["articles", "listings", "projects"],
     "lifestyle_search":  ["listings", "social_neighborhood", "articles", "projects"],
-    "calculate_finance": ["listings"],        # price context for the region; LLM does the math
+    "calculate_finance": [],                  # pure calculator intent; combine with search_listing when property search is requested
     "market_report":     [],                  # handled by SQL in chain.py, not Qdrant
 }
 
@@ -422,8 +422,10 @@ class QueryParser:
             for coll in _INTENT_TO_COLLECTIONS.get(i, []):
                 if coll not in collections:
                     collections.append(coll)
-        # Default collection fallback if union is empty
-        if not collections:
+        # Default collection fallback only for open-ended knowledge queries.
+        # Calculator/market intents intentionally use tools or deterministic
+        # code paths and should not automatically search Qdrant collections.
+        if not collections and "ask_knowledge" in intents:
             collections = ["articles", "listings", "projects"]
 
         return ParsedQuery(
@@ -441,7 +443,11 @@ class QueryParser:
         intents: list[str] = []
         lifestyle_signals: list[str] = []
 
-        if any(kw in text for kw in ["lãi suất", "trả góp", "khoản vay", "vay ngân hàng", "lãi vay"]):
+        if any(kw in text for kw in [
+            "lãi suất", "trả góp", "khoản vay", "vay ngân hàng", "lãi vay",
+            "vay ", "vay mua", "thu nhập", "khả năng tài chính",
+            "mỗi tháng trả", "trả bao nhiêu", "dư nợ",
+        ]):
             intents.append("calculate_finance")
         if any(kw in text for kw in ["so sánh", "khác gì", "tốt hơn", "nên chọn"]):
             intents.append("compare_project")
@@ -473,7 +479,7 @@ class QueryParser:
             for coll in _INTENT_TO_COLLECTIONS.get(i, []):
                 if coll not in collections:
                     collections.append(coll)
-        if not collections:
+        if not collections and "ask_knowledge" in intents:
             collections = ["articles", "listings", "projects"]
 
         return ParsedQuery(

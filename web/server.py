@@ -575,10 +575,23 @@ def chat(payload: ChatRequest):
                         "intent": event.get("intent", ""),
                         "filters_applied": event.get("filters", {}),
                         "sources": sources,
+                        "retrieved_sources": event.get("retrieved_sources", sources),
+                        "cited_sources": event.get("cited_sources", []),
                         "listings": mapped_listings,
                         "llm_used": True,
                     }
                     yield f"event: metadata\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
+
+                elif etype == "final_metadata":
+                    cited_sources = event.get("cited_sources", [])
+                    final_payload = {
+                        "intent": event.get("intent", ""),
+                        "filters_applied": event.get("filters", {}),
+                        "retrieved_sources": event.get("retrieved_sources", []),
+                        "cited_sources": cited_sources,
+                        "llm_used": True,
+                    }
+                    yield f"event: final_metadata\ndata: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
 
                 elif etype in ["thought", "tool_call", "observation"]:
                     text = event.get("text", "")
@@ -607,6 +620,8 @@ def chat(payload: ChatRequest):
                 "intent": "local_fallback",
                 "filters_applied": {},
                 "sources": [],
+                "retrieved_sources": [],
+                "cited_sources": [],
                 "listings": listings,
                 "llm_used": False,
                 "error": str(exc),

@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from db.config import ENABLE_RERANKER, RERANKER_CANDIDATES
+from db.config import ENABLE_RERANKER, RERANKER_CANDIDATES, RETRIEVAL_COLLAPSE_BY_SOURCE
 from db.vectorstore import VectorStore
 from rag.reranker import VietnameseReranker
 
@@ -129,9 +129,7 @@ class Retriever:
                 all_docs[:RERANKER_CANDIDATES],
                 rerank_keep,
             )
-        result = self._collapse_by_source(all_docs, top_k=top_k)
-
-        return result
+        return self._finalize_results(all_docs, top_k=top_k)
 
     def hybrid_retrieve(
         self,
@@ -178,9 +176,9 @@ class Retriever:
                 merged[:RERANKER_CANDIDATES],
                 rerank_keep,
             )
-            return self._collapse_by_source(reranked, top_k=top_k)
+            return self._finalize_results(reranked, top_k=top_k)
         merged.sort(key=lambda d: d.score, reverse=True)
-        return self._collapse_by_source(merged, top_k=top_k)
+        return self._finalize_results(merged, top_k=top_k)
 
     def keyword_retrieve(
         self,
@@ -497,13 +495,15 @@ class Retriever:
         return unique
 
     def _merge_candidates(self, docs: list[RetrievedDocument]) -> list[RetrievedDocument]:
-        best: dict[tuple[str, str, str], RetrievedDocument] = {}
+        """Merge dense/sparse/keyword candidates without collapsing a source record."""
+        best: dict[tuple[str, str, str, str], RetrievedDocument] = {}
         for doc in docs:
             meta = doc.metadata or {}
             key = (
                 doc.collection,
                 str(meta.get("source_record_id") or meta.get("url") or doc.text[:80]),
                 str(meta.get("chunk_type") or "record"),
+                str(meta.get("chunk_index") if meta.get("chunk_index") is not None else doc.text[:160].strip()),
             )
             existing = best.get(key)
             if existing is None or doc.score > existing.score:
@@ -511,6 +511,16 @@ class Retriever:
         merged = list(best.values())
         merged.sort(key=lambda d: d.score, reverse=True)
         return merged
+
+    def _finalize_results(
+        self,
+        docs: list[RetrievedDocument],
+        top_k: Optional[int] = None,
+    ) -> list[RetrievedDocument]:
+        """Apply the final retrieval policy before returning context to tools."""
+        if RETRIEVAL_COLLAPSE_BY_SOURCE:
+            return self._collapse_by_source(docs, top_k=top_k)
+        return docs[:top_k] if top_k is not None else docs
 
     def _collapse_by_source(
         self,

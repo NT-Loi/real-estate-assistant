@@ -33,6 +33,7 @@ from rag.prompts import (
 )
 from rag.llm import LLMClient
 from rag.finance_calculator import FinanceCalculator
+from db.config import RETRIEVAL_MIN_HYBRID_LIMIT, RETRIEVAL_MIN_SEMANTIC_LIMIT
 from db.vectorstore import VectorStore
 
 log = logging.getLogger("bds_chain")
@@ -417,13 +418,52 @@ def _compute_finance_summary(parsed: ParsedQuery) -> str:
     return "\n".join(parts)
 
 
+def _money_arg_to_vnd(value: object, *, monthly: bool = False) -> Optional[float]:
+    """Normalize model-provided money values into VND.
+
+    Native function schema asks for VND, but models sometimes pass shorthand
+    numbers such as 5 for 5 billion or 60 for 60 million monthly income.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        number = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    if monthly and number >= 1_000_000:
+        return number
+    if number >= 100_000_000:
+        return number
+    if monthly:
+        return number * 1_000_000
+    if number >= 1_000:
+        return number * 1_000_000
+    return number * 1_000_000_000
+
+
+def _fmt_vnd(value: float) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f} tỷ"
+    return f"{value / 1_000_000:.0f} triệu"
+
+
+_CITATION_URL_RE = re.compile(r"(?:https?://[^\s)\]}>,\"']+|hf://[^\s)\]}>,\"']+)", re.IGNORECASE)
+
+
+def _normalize_citation_url(url: object) -> str:
+    return str(url or "").strip().rstrip(".,;:!?)]}>\"'")
+
+
 @dataclass
 class RAGResponse:
     """Complete response from the RAG pipeline."""
     answer: str                              # Generated or formatted answer
-    sources: list[RetrievedDocument]         # Retrieved source documents
+    sources: list[RetrievedDocument]         # Retrieved/candidate source documents
     intent: str                              # Detected query intent
     filters_applied: dict                    # Metadata filters that were applied
+    cited_sources: list[RetrievedDocument] = field(default_factory=list)  # Sources explicitly cited in answer
     parsed_query: Optional[ParsedQuery] = None  # Full parsed query details
     llm_used: bool = False                   # Whether LLM was used for generation
     effective_query: str = ""                # Query after multi-turn merge, if any
@@ -559,10 +599,11 @@ class RAGChain:
     def _current_lifestyle_signals(self) -> list[str]:
         return self._current_parsed.lifestyle_signals if self._current_parsed else []
 
-    def _tool_semantic_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 5) -> str:
+    def _tool_semantic_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 10) -> str:
         """Run semantic search on Qdrant."""
         try:
             collections = self._default_collections(collections)
+            limit = max(int(limit or 0), RETRIEVAL_MIN_SEMANTIC_LIMIT)
             log.info(f"Tool called: semantic_search({query_text=}, {collections=}, {limit=})")
             docs = self._retriever.retrieve(
                 query_text=query_text,
@@ -579,10 +620,11 @@ class RAGChain:
         except Exception as e:
             return f"Lỗi khi tìm kiếm ngữ nghĩa: {e}"
 
-    def _tool_hybrid_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 5) -> str:
+    def _tool_hybrid_search(self, query_text: str, collections: Optional[list[str]] = None, limit: int = 12) -> str:
         """Run dense + keyword retrieval, followed by reranking when available."""
         try:
             collections = self._default_collections(collections)
+            limit = max(int(limit or 0), RETRIEVAL_MIN_HYBRID_LIMIT)
             log.info(f"Tool called: hybrid_search({query_text=}, {collections=}, {limit=})")
             docs = self._retriever.hybrid_retrieve(
                 query_text=query_text,
@@ -1179,6 +1221,136 @@ class RAGChain:
             limit=limit,
         )
 
+    def _tool_calculate_finance(self, **kwargs) -> str:
+        """Run deterministic mortgage/affordability calculations."""
+        try:
+            log.info(f"Tool called: calculate_finance({kwargs=})")
+            property_price_vnd = _money_arg_to_vnd(
+                kwargs.get("property_price_vnd")
+                or kwargs.get("property_price")
+                or kwargs.get("price_vnd")
+            )
+            loan_principal_vnd = _money_arg_to_vnd(
+                kwargs.get("loan_principal_vnd")
+                or kwargs.get("principal_vnd")
+                or kwargs.get("loan_amount_vnd")
+            )
+            down_payment_vnd = _money_arg_to_vnd(
+                kwargs.get("down_payment_vnd")
+                or kwargs.get("down_payment")
+            )
+            monthly_income_vnd = _money_arg_to_vnd(
+                kwargs.get("monthly_income_vnd")
+                or kwargs.get("income_vnd")
+                or kwargs.get("monthly_income"),
+                monthly=True,
+            )
+
+            annual_rate_pct = float(kwargs.get("annual_rate_pct") or kwargs.get("interest_rate_pct") or 9.0)
+            term_years = int(float(kwargs.get("term_years") or kwargs.get("loan_years") or 20))
+            term_years = max(1, min(term_years, 35))
+            dti_ratio = float(kwargs.get("dti_ratio") or 0.40)
+            dti_ratio = max(0.05, min(dti_ratio, 0.80))
+
+            down_payment_pct = kwargs.get("down_payment_pct")
+            if down_payment_pct is None:
+                down_payment_pct = kwargs.get("down_pct")
+            down_payment_pct = float(down_payment_pct) if down_payment_pct is not None else None
+            if down_payment_pct is not None and down_payment_pct > 1:
+                down_payment_pct = down_payment_pct / 100
+            if down_payment_pct is None:
+                down_payment_pct = 0.30
+            down_payment_pct = max(0.0, min(down_payment_pct, 0.95))
+
+            parts: list[str] = [
+                "=== KẾT QUẢ TÍNH TOÁN TÀI CHÍNH (deterministic, không dùng LLM để tính toán) ===",
+                f"Giả định lãi suất: {annual_rate_pct:.2f}%/năm",
+                f"Thời hạn vay: {term_years} năm",
+            ]
+
+            plan = None
+            if property_price_vnd:
+                if down_payment_vnd is not None:
+                    loan_principal_vnd = max(property_price_vnd - down_payment_vnd, 0)
+                    down_payment_pct = down_payment_vnd / property_price_vnd if property_price_vnd else down_payment_pct
+                    plan = FinanceCalculator.monthly_payment(
+                        principal_vnd=loan_principal_vnd,
+                        annual_rate_pct=annual_rate_pct,
+                        term_years=term_years,
+                    )
+                    plan.property_price_vnd = property_price_vnd
+                    plan.down_payment_vnd = down_payment_vnd
+                    plan.down_payment_pct = down_payment_pct * 100
+                else:
+                    plan = FinanceCalculator.loan_from_property_price(
+                        property_price_vnd=property_price_vnd,
+                        down_payment_pct=down_payment_pct,
+                        annual_rate_pct=annual_rate_pct,
+                        term_years=term_years,
+                    )
+                    loan_principal_vnd = plan.principal_vnd
+                parts.append("\n" + plan.summary_text())
+            elif loan_principal_vnd:
+                plan = FinanceCalculator.monthly_payment(
+                    principal_vnd=loan_principal_vnd,
+                    annual_rate_pct=annual_rate_pct,
+                    term_years=term_years,
+                )
+                parts.append("\n" + plan.summary_text())
+
+            if loan_principal_vnd:
+                raw_rates = kwargs.get("scenario_rates_pct") or kwargs.get("scenario_rates") or [7.0, 8.5, 9.0, 10.5, 12.0]
+                if isinstance(raw_rates, str):
+                    raw_rates = [r.strip() for r in raw_rates.split(",") if r.strip()]
+                try:
+                    rates = [float(r) for r in raw_rates][:8]
+                except Exception:
+                    rates = [7.0, 8.5, 9.0, 10.5, 12.0]
+                scenarios = FinanceCalculator.multi_scenario(
+                    principal_vnd=loan_principal_vnd,
+                    rates=rates,
+                    term_years=term_years,
+                )
+                parts.append("\n--- So sánh theo lãi suất ---")
+                for scenario in scenarios:
+                    parts.append(
+                        f"- {scenario.annual_rate_pct:.1f}%/năm: "
+                        f"{_fmt_vnd(scenario.monthly_payment_vnd)}/tháng, "
+                        f"tổng lãi {_fmt_vnd(scenario.total_interest_vnd)}"
+                    )
+
+            if monthly_income_vnd:
+                afford = FinanceCalculator.max_affordable_loan(
+                    monthly_income_vnd=monthly_income_vnd,
+                    annual_rate_pct=annual_rate_pct,
+                    term_years=term_years,
+                    dti_ratio=dti_ratio,
+                )
+                parts.append("\n" + afford.summary_text())
+                if loan_principal_vnd:
+                    max_pay = afford.max_monthly_payment_vnd
+                    monthly_payment = plan.monthly_payment_vnd if plan else 0
+                    ratio = monthly_payment / monthly_income_vnd if monthly_income_vnd else 0
+                    parts.append(
+                        "\n--- Đánh giá khả năng chi trả ---\n"
+                        f"- Khoản trả hàng tháng / thu nhập: {ratio * 100:.1f}%.\n"
+                        f"- Ngưỡng an toàn theo DTI {dti_ratio * 100:.0f}%: {_fmt_vnd(max_pay)}/tháng."
+                    )
+
+            if len(parts) <= 3:
+                return (
+                    "Thiếu dữ liệu để tính tài chính. Cần ít nhất một trong các thông tin: "
+                    "giá BĐS, khoản vay, hoặc thu nhập hàng tháng; có thể bổ sung lãi suất và thời hạn vay."
+                )
+
+            parts.append(
+                "\nLưu ý: Đây là tính toán tham khảo theo công thức PMT cố định. "
+                "Lãi suất thực tế, phí phạt trả trước, bảo hiểm và ưu đãi ngân hàng có thể làm kết quả thay đổi."
+            )
+            return "\n".join(parts)
+        except Exception as e:
+            return f"Lỗi khi tính toán tài chính: {e}"
+
     def _tool_analyze_market_trend(self, **kwargs) -> str:
         """Analyze historical market trends and compare property price."""
         try:
@@ -1607,6 +1779,8 @@ class RAGChain:
             return self._call_tool_safely(tool_name, self._tool_search_metro_stations, args)
         elif tool_name == "find_listings_near_metro":
             return self._call_tool_safely(tool_name, self._tool_find_listings_near_metro, args)
+        elif tool_name == "calculate_finance":
+            return self._call_tool_safely(tool_name, self._tool_calculate_finance, args)
         elif tool_name == "analyze_market_trend":
             return self._call_tool_safely(tool_name, self._tool_analyze_market_trend, args)
         elif tool_name == "get_market_statistics":
@@ -1641,7 +1815,7 @@ class RAGChain:
         declarations = [
             types.FunctionDeclaration(
                 name="hybrid_search",
-                description="Tìm kiếm hybrid Qdrant dense + sparse trên nhiều nguồn nội bộ.",
+                description="Tìm kiếm hybrid Qdrant dense + sparse trên nhiều nguồn nội bộ. Với truy vấn tìm listing/lifestyle, nên đặt limit 10-15 để có nhiều phương án.",
                 parameters_json_schema=obj({
                     "query_text": {"type": "string"},
                     "collections": collection_array,
@@ -1650,7 +1824,7 @@ class RAGChain:
             ),
             types.FunctionDeclaration(
                 name="semantic_search",
-                description="Tìm kiếm ngữ nghĩa thuần trên các chunk đã embed.",
+                description="Tìm kiếm ngữ nghĩa thuần trên các chunk đã embed. Với truy vấn tìm listing/lifestyle, nên đặt limit 10-15 để có nhiều phương án.",
                 parameters_json_schema=obj({
                     "query_text": {"type": "string"},
                     "collections": collection_array,
@@ -1758,6 +1932,24 @@ class RAGChain:
                 parameters_json_schema=obj({"url": {"type": "string"}}, ["url"]),
             ),
             types.FunctionDeclaration(
+                name="calculate_finance",
+                description=(
+                    "Tính toán khoản vay, trả góp hàng tháng, tổng lãi và khả năng vay mua nhà bằng công thức deterministic. "
+                    "Dùng cho câu hỏi vay, lãi suất, trả góp, thu nhập, khả năng tài chính. Không để LLM tự tính nhẩm."
+                ),
+                parameters_json_schema=obj({
+                    "property_price_vnd": {"type": "number", "description": "Giá BĐS bằng VND. Nếu người dùng nói 5 tỷ, truyền 5000000000."},
+                    "loan_principal_vnd": {"type": "number", "description": "Khoản vay gốc bằng VND nếu người dùng nêu trực tiếp khoản vay."},
+                    "down_payment_vnd": {"type": "number", "description": "Số tiền trả trước bằng VND."},
+                    "down_payment_pct": {"type": "number", "description": "Tỷ lệ trả trước, ví dụ 30 cho 30% hoặc 0.3."},
+                    "annual_rate_pct": {"type": "number", "description": "Lãi suất năm, ví dụ 9.5."},
+                    "term_years": {"type": "integer", "minimum": 1, "maximum": 35},
+                    "monthly_income_vnd": {"type": "number", "description": "Thu nhập hàng tháng bằng VND."},
+                    "dti_ratio": {"type": "number", "description": "Tỷ lệ trả nợ/thu nhập an toàn, mặc định 0.4."},
+                    "scenario_rates_pct": {"type": "array", "items": {"type": "number"}},
+                }),
+            ),
+            types.FunctionDeclaration(
                 name="analyze_market_trend",
                 description="Phân tích xu hướng giá và đối chiếu giá trị BĐS theo khu vực.",
                 parameters_json_schema=obj({
@@ -1833,6 +2025,68 @@ class RAGChain:
             })
         return serialized_sources
 
+    def _extract_cited_urls(self, answer: str) -> list[str]:
+        seen: set[str] = set()
+        urls: list[str] = []
+        for match in _CITATION_URL_RE.finditer(answer or ""):
+            url = _normalize_citation_url(match.group(0))
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
+    def _cited_sources_from_docs(
+        self,
+        answer: str,
+        docs: list[RetrievedDocument],
+    ) -> list[RetrievedDocument]:
+        cited_urls = self._extract_cited_urls(answer)
+        if not cited_urls:
+            return []
+
+        by_url: dict[str, RetrievedDocument] = {}
+        for doc in docs:
+            meta = getattr(doc, "metadata", {}) or {}
+            url = _normalize_citation_url(meta.get("url") or meta.get("source_url") or meta.get("source"))
+            if url and url not in by_url:
+                by_url[url] = doc
+
+        cited_docs: list[RetrievedDocument] = []
+        for cited_url in cited_urls:
+            doc = by_url.get(cited_url)
+            if doc is None:
+                doc = next((source for url, source in by_url.items() if cited_url in url or url in cited_url), None)
+            if doc is not None and doc not in cited_docs:
+                cited_docs.append(doc)
+        return cited_docs
+
+    def _cited_serialized_sources(
+        self,
+        answer: str,
+        sources: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        cited_urls = self._extract_cited_urls(answer)
+        if not cited_urls:
+            return []
+
+        by_url: dict[str, dict[str, Any]] = {}
+        for source in sources:
+            meta = source.get("metadata") or {}
+            url = _normalize_citation_url(
+                source.get("url") or meta.get("url") or meta.get("source_url") or meta.get("source")
+            )
+            if url and url not in by_url:
+                by_url[url] = source
+
+        cited_sources: list[dict[str, Any]] = []
+        for cited_url in cited_urls:
+            source = by_url.get(cited_url)
+            if source is None:
+                source = next((item for url, item in by_url.items() if cited_url in url or url in cited_url), None)
+            if source is not None and source not in cited_sources:
+                cited_sources.append(source)
+        return cited_sources
+
     def _unique_agent_sources(self) -> list[RetrievedDocument]:
         seen_urls = set()
         unique_sources = []
@@ -1883,6 +2137,7 @@ class RAGChain:
             f"Bộ lọc đã phân tích: {json.dumps(parsed.filters, ensure_ascii=False)}\n"
             f"Tín hiệu lifestyle: {', '.join(parsed.lifestyle_signals or []) or 'không có'}\n\n"
             "Hãy dùng function calls để lấy dữ liệu cần thiết trước khi trả lời. "
+            "Nếu người dùng hỏi vay, lãi suất, trả góp hoặc khả năng tài chính, dùng calculate_finance và không tự tính nhẩm. "
             "Nếu người dùng hỏi POI quanh một dự án/địa điểm cụ thể theo bán kính, dùng find_pois_near_location. "
             "Nếu cần kiểm tra tiêu chí gần POI khi tìm tin đăng, dùng find_listings_near_pois hoặc find_nearby_pois. "
             "Nếu cần tìm mô tả như ít ngập/yên tĩnh/gần trường học trong dữ liệu, dùng hybrid_search."
@@ -2016,13 +2271,16 @@ class RAGChain:
             break
 
         unique_sources = self._unique_agent_sources()
+        serialized_sources = self._serialize_sources(unique_sources)
         yield {
             "type": "metadata",
             "intent": parsed.intent,
             "filters": parsed.filters,
             "effective_query": effective_query,
             "used_conversation_memory": effective_query != user_query,
-            "sources": self._serialize_sources(unique_sources),
+            "sources": serialized_sources,
+            "retrieved_sources": serialized_sources,
+            "cited_sources": [],
         }
 
         if not final_answer:
@@ -2060,6 +2318,16 @@ class RAGChain:
         )
         yield {"type": "status", "text": "✍️ Đang tạo câu trả lời..."}
         yield {"type": "chunk", "text": final_answer}
+        cited_sources = self._cited_serialized_sources(final_answer, serialized_sources)
+        yield {
+            "type": "final_metadata",
+            "intent": parsed.intent,
+            "filters": parsed.filters,
+            "effective_query": effective_query,
+            "used_conversation_memory": effective_query != user_query,
+            "retrieved_sources": serialized_sources,
+            "cited_sources": cited_sources,
+        }
         yield {"type": "done"}
 
     def _final_answer_gate(
@@ -2367,20 +2635,26 @@ class RAGChain:
         if self._use_native_function_calling():
             answer_parts: list[str] = []
             metadata: dict[str, Any] = {}
+            final_metadata: dict[str, Any] = {}
             for event in self._query_stream_native_gemini(user_query, top_k=top_k, session_id=session_id):
                 if event.get("type") == "chunk":
                     answer_parts.append(event.get("text", ""))
                 elif event.get("type") == "metadata":
                     metadata = event
+                elif event.get("type") == "final_metadata":
+                    final_metadata = event
             parsed = self._current_parsed or self._parser.parse(metadata.get("effective_query") or user_query)
+            answer = "".join(answer_parts)
+            unique_sources = self._unique_agent_sources()
             return RAGResponse(
-                answer="".join(answer_parts),
-                sources=self._unique_agent_sources(),
+                answer=answer,
+                sources=unique_sources,
                 intent=parsed.intent,
                 filters_applied=parsed.filters,
+                cited_sources=self._cited_sources_from_docs(answer, unique_sources),
                 parsed_query=parsed,
                 llm_used=True,
-                effective_query=metadata.get("effective_query") or user_query,
+                effective_query=final_metadata.get("effective_query") or metadata.get("effective_query") or user_query,
             )
         
         # Reset retrieved sources cache
@@ -2584,6 +2858,7 @@ class RAGChain:
             sources=unique_sources,
             intent=parsed.intent,
             filters_applied=parsed.filters,
+            cited_sources=self._cited_sources_from_docs(answer, unique_sources),
             parsed_query=parsed,
             llm_used=llm_used,
             effective_query=effective_query,
@@ -2778,6 +3053,8 @@ class RAGChain:
                 "effective_query": effective_query,
                 "used_conversation_memory": effective_query != user_query,
                 "sources": serialized_sources,
+                "retrieved_sources": serialized_sources,
+                "cited_sources": [],
             }
 
             if self._should_ask_clarification_only(parsed, raw_final):
@@ -2794,6 +3071,15 @@ class RAGChain:
                 )
                 yield {"type": "status", "text": "✍️ Đang tạo câu hỏi làm rõ..."}
                 yield {"type": "chunk", "text": clarification_answer}
+                yield {
+                    "type": "final_metadata",
+                    "intent": parsed.intent,
+                    "filters": parsed.filters,
+                    "effective_query": effective_query,
+                    "used_conversation_memory": effective_query != user_query,
+                    "retrieved_sources": serialized_sources,
+                    "cited_sources": self._cited_serialized_sources(clarification_answer, serialized_sources),
+                }
                 yield {"type": "done"}
                 return
 
@@ -2832,6 +3118,15 @@ class RAGChain:
                 answer=streamed_answer,
                 source_count=len(self._agent_sources),
             )
+            yield {
+                "type": "final_metadata",
+                "intent": parsed.intent,
+                "filters": parsed.filters,
+                "effective_query": effective_query,
+                "used_conversation_memory": effective_query != user_query,
+                "retrieved_sources": serialized_sources,
+                "cited_sources": self._cited_serialized_sources(streamed_answer, serialized_sources),
+            }
             yield {"type": "done"}
 
         else:
@@ -2854,8 +3149,17 @@ class RAGChain:
                 "intent": parsed.intent,
                 "filters": parsed.filters,
                 "sources": [],
+                "retrieved_sources": [],
+                "cited_sources": [],
             }
             yield {"type": "chunk", "text": fallback_text}
+            yield {
+                "type": "final_metadata",
+                "intent": parsed.intent,
+                "filters": parsed.filters,
+                "retrieved_sources": [],
+                "cited_sources": [],
+            }
             yield {"type": "done"}
 
 

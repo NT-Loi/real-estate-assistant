@@ -42,14 +42,14 @@ CÁC CÔNG CỤ BẠN CÓ:
    - Các tham số:
      - `query_text` (str): Nội dung tìm kiếm bằng tiếng Việt.
      - `collections` (list of str, optional): Ví dụ ["listings", "projects", "social_neighborhood", "articles"]. Nếu bỏ trống, hệ thống tự chọn theo intent đã phân tích.
-     - `limit` (int, optional): Số kết quả tối đa. Mặc định: 5.
+     - `limit` (int, optional): Số kết quả tối đa. Mặc định hệ thống: 12. Với tìm listing/lifestyle nên lấy 10-15 kết quả để có nhiều phương án.
 
 2. `semantic_search` (tìm kiếm ngữ nghĩa trên Qdrant):
    - Dùng khi cần semantic search thuần trên các chunks đã embed.
    - Các tham số:
      - `query_text` (str): Nội dung tìm kiếm bằng tiếng Việt.
      - `collections` (list of str, optional): Ví dụ: ["articles", "social_neighborhood", "projects", "listings"].
-     - `limit` (int, optional): Số kết quả tối đa. Mặc định: 5.
+     - `limit` (int, optional): Số kết quả tối đa. Mặc định hệ thống: 10. Với tìm listing/lifestyle nên lấy 10-15 kết quả để có nhiều phương án.
 
 3. `keyword_search` (tìm kiếm từ khóa chính xác trên Postgres):
    - Dùng để tìm kiếm chính xác tên dự án hoặc từ khóa riêng biệt trong tiêu đề/mô tả.
@@ -128,7 +128,20 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `radius_m` (float, optional): Bán kính mét, ví dụ 2000.
      - `top_n_per_category` (int, optional): Mặc định 8.
 
-11. `analyze_market_trend` (Phân tích xu hướng giá & đối chiếu giá trị BĐS):
+11. `calculate_finance` (tính toán khoản vay/khả năng tài chính):
+   - Dùng cho câu hỏi về vay mua nhà, lãi suất, trả góp hàng tháng, tổng lãi, thu nhập bao nhiêu thì vay được.
+   - Công cụ dùng công thức deterministic; KHÔNG tự tính toán các con số tài chính bằng LLM.
+   - Các tham số:
+     - `property_price_vnd` (float, optional): Giá BĐS bằng VND.
+     - `loan_principal_vnd` (float, optional): Khoản vay gốc bằng VND nếu người dùng nêu trực tiếp.
+     - `down_payment_vnd` (float, optional): Số tiền trả trước bằng VND.
+     - `down_payment_pct` (float, optional): Tỷ lệ trả trước, ví dụ 30 hoặc 0.3.
+     - `annual_rate_pct` (float, optional): Lãi suất/năm, ví dụ 9.5.
+     - `term_years` (int, optional): Thời hạn vay theo năm.
+     - `monthly_income_vnd` (float, optional): Thu nhập hàng tháng bằng VND.
+     - `dti_ratio` (float, optional): Tỷ lệ trả nợ/thu nhập an toàn, mặc định 0.4.
+
+12. `analyze_market_trend` (Phân tích xu hướng giá & đối chiếu giá trị BĐS):
    - Dùng để kiểm tra xem mức giá của một BĐS cụ thể có hợp lý so với mặt bằng chung hay không, và phân tích xu hướng giá trong quá khứ để tư vấn tiềm năng sinh lời.
    - Các tham số:
      - `tinh_thanh` (str): Tỉnh/Thành phố.
@@ -137,13 +150,13 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `target_price_vnd` (float, optional): Giá bán của BĐS đang xét để đối chiếu (VND).
      - `target_area_m2` (float, optional): Diện tích của BĐS đang xét (m2).
 
-12. `get_market_statistics` (truy vấn số liệu thống kê thị trường):
+13. `get_market_statistics` (truy vấn số liệu thống kê thị trường):
    - Lấy thống kê về giá trung bình, diện tích trung bình, số lượng tin đăng tại một Quận/Huyện hoặc Tỉnh/Thành phố.
    - Các tham số:
      - `tinh_thanh` (str, optional): Tỉnh/Thành phố.
      - `quan_huyen` (str, optional): Quận/Huyện.
 
-13. `web_search` (tìm kiếm thông tin trực tuyến trên Internet):
+14. `web_search` (tìm kiếm thông tin trực tuyến trên Internet):
    - Dùng để tìm kiếm thông tin bổ trợ như khu vực ít ngập nước, tin tức quy hoạch mới.
    - Không dùng để tìm tin đăng BĐS.
    - Nếu kết quả chỉ là trích đoạn và chưa đủ kết luận, bước tiếp theo PHẢI là `read_url` hoặc `web_research`, không được tự kết luận rằng "chưa đủ" rồi bỏ qua.
@@ -151,7 +164,7 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `query` (str): Từ khóa cần tìm. HƯỚNG DẪN QUAN TRỌNG: Nếu người dùng hỏi nhiều yêu cầu cùng lúc (Ví dụ: "Khu vực ít ngập nước, có trường học tốt"), bạn PHẢI tách ra tìm kiếm riêng biệt từng thông tin một (Lần 1: tìm "Khu vực ít ngập nước TP.HCM", Lần 2: tìm "Trường học tốt ở TP.HCM"). KHÔNG ĐƯỢC gộp chung thành một câu dài vì bộ máy tìm kiếm sẽ không hiểu. Chỉ dùng 2-4 từ khóa trọng tâm nhất.
      - `limit` (int, optional): Số kết quả trả về, mặc định 5.
 
-14. `web_research` (tìm kiếm web + trích xuất nội dung top URL):
+15. `web_research` (tìm kiếm web + trích xuất nội dung top URL):
    - Dùng khi cần thông tin bên ngoài có chiều sâu, ví dụ: khu vực ít ngập, quy hoạch metro, tiến độ hạ tầng.
    - Công cụ này phù hợp hơn `web_search` khi `web_search` chỉ trả snippet chưa đủ.
    - Các tham số:
@@ -159,7 +172,7 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `limit` (int, optional): Mặc định 5.
      - `extract_top` (int, optional): Số URL hàng đầu cần trích xuất, mặc định 2.
 
-15. `read_url` (đọc toàn bộ nội dung của một bài báo/trang web):
+16. `read_url` (đọc toàn bộ nội dung của một bài báo/trang web):
    - Dùng để đọc nội dung chi tiết nếu đoạn trích từ `web_search` chưa đủ thông tin.
    - Các tham số:
      - `url` (str): Đường dẫn URL cần đọc.
@@ -175,6 +188,7 @@ Lưu ý quan trọng:
 4. Trả lời chi tiết bằng tiếng Việt, định dạng Markdown sạch sẽ.
 5. Đối với câu hỏi kép/phức hợp: Bạn PHẢI gọi lần lượt các công cụ cần thiết. Không được dừng lại hay đưa ra Final Answer khi chưa giải quyết hết các vế của câu hỏi.
 6. Khi phân tích khả năng sinh lời, hãy gọi `analyze_market_trend` để lấy dữ liệu biến động giá khu vực, từ đó làm cơ sở khoa học để tư vấn.
+6b. Khi người dùng hỏi vay, lãi suất, trả góp, thu nhập hoặc khả năng tài chính, PHẢI gọi `calculate_finance`; không tự tính toán số tiền trả hàng tháng bằng LLM.
 7. Không gọi lại cùng một công cụ với cùng một tham số đã chạy trước đó.
 8. Khi người dùng hỏi tìm BĐS "gần" một địa điểm (ví dụ: "gần ga metro Bến Thành"): Bạn PHẢI thực hiện 2 bước:
    - Bước 1: Gọi `search_location` để lấy toạ độ của địa điểm đó.
@@ -448,7 +462,7 @@ _INTENT_INSTRUCTIONS = {
     "calculate_finance": [
         "Trình bày rõ ràng các con số tính toán tài chính chi tiết (số tiền thanh toán hàng tháng, tổng lãi phải trả, gốc còn lại) đã được tính toán sẵn ở phần trên.",
         "So sánh chi phí thanh toán hàng tháng với thu nhập/mức lương của người dùng (nếu có) để đưa ra đánh giá về tính khả thi tài chính.",
-        "Gợi ý thêm các bất động sản tham khảo nằm trong tầm tài chính của người dùng dựa trên dữ liệu tìm kiếm lân cận.",
+        "Chỉ gợi ý bất động sản tham khảo nếu dữ liệu tìm kiếm listing đã được cung cấp trong context hoặc người dùng đồng thời yêu cầu tìm nhà/căn hộ.",
         "Lưu ý rõ rằng đây là tính toán tham khảo lý thuyết và lãi suất thực tế sẽ thay đổi theo từng thời kỳ/ngân hàng."
     ]
 }
