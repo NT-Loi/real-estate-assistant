@@ -28,6 +28,14 @@ except ImportError:
 log = logging.getLogger("bds_llm")
 
 
+def _request_timeout_ms() -> int:
+    raw = os.getenv("GEMINI_REQUEST_TIMEOUT_MS", os.getenv("LLM_REQUEST_TIMEOUT_MS", "120000"))
+    try:
+        return max(1000, int(raw))
+    except (TypeError, ValueError):
+        return 120000
+
+
 class LLMClient:
     """
     LLM wrapper supporting Google Gemini API and Ollama.
@@ -155,6 +163,7 @@ class LLMClient:
             tool_config = None
 
         config = types.GenerateContentConfig(
+            http_options=types.HttpOptions(timeout=_request_timeout_ms()),
             max_output_tokens=max_tokens,
             temperature=temperature,
             system_instruction=system_prompt or "",
@@ -260,6 +269,7 @@ class LLMClient:
                 return ""
 
             config = types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=_request_timeout_ms()),
                 max_output_tokens=max_tokens,
                 temperature=temperature,
                 system_instruction=system_prompt or "",
@@ -305,6 +315,83 @@ class LLMClient:
 
             log.error(f"All LLM models exhausted. Last error: {last_error}")
             return ""
+
+    def generate_json(
+        self,
+        prompt: str,
+        response_schema: dict[str, Any],
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+    ) -> dict[str, Any] | None:
+        """Generate a JSON object using Gemini/Vertex structured output when available."""
+        if not self._available:
+            return None
+
+        if self._provider == "ollama":
+            raw = self.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            try:
+                return json.loads(raw)
+            except Exception:
+                return None
+
+        import time
+        try:
+            from google.genai import types
+        except ImportError:
+            return None
+
+        config = types.GenerateContentConfig(
+            http_options=types.HttpOptions(timeout=_request_timeout_ms()),
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+            system_instruction=system_prompt or "",
+            response_mime_type="application/json",
+            response_schema=response_schema,
+        )
+
+        models_to_try = [self._model_name]
+        if self._model_name not in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"):
+            models_to_try.append("gemini-2.0-flash")
+
+        last_error = None
+        for model in models_to_try:
+            for attempt in range(3):
+                try:
+                    response = self._client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    parsed = getattr(response, "parsed", None)
+                    if isinstance(parsed, dict):
+                        return parsed
+
+                    text = LLMClient._extract_non_thought_text(response)
+                    if not text:
+                        return None
+                    return json.loads(text)
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        last_error = e
+                        if attempt == 0:
+                            log.warning(f"Rate limited on JSON generation {model}, waiting 1s…")
+                            time.sleep(1)
+                        else:
+                            log.warning(f"Rate limited on JSON generation {model}, trying fallback model…")
+                        continue
+                    log.warning(f"JSON generation error [{model}]: {e}")
+                    last_error = e
+                    break
+
+        log.warning(f"All JSON generation models exhausted. Last error: {last_error}")
+        return None
 
 
     def generate_stream(
@@ -399,6 +486,7 @@ class LLMClient:
                 return
 
             config = types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=_request_timeout_ms()),
                 max_output_tokens=max_tokens,
                 temperature=temperature,
                 system_instruction=system_prompt or "",

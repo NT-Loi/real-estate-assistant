@@ -1,3 +1,4 @@
 # Optional dependencies for scripts/evaluate_ragas.py
 ragas
+langchain-community
 langchain-google-vertexai

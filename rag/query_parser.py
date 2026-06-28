@@ -84,6 +84,7 @@ lifestyle_signals (use only these): metro, school, hospital, park, shopping, flo
 
 filters keys (only include if clearly mentioned):
 - gia_trieu: price in million VND. "3 ty" = {"$lte": 3000}, "2-4 ty" = {"$gte": 2000, "$lte": 4000}
+- dien_tich_m2: area in square meters. "460 m2" = {"$gte": 414, "$lte": 506}, "400-500 m2" = {"$gte": 400, "$lte": 500}
 - so_phong_ngu: integer number of bedrooms
 - tinh_thanh: city/province name in Vietnamese
 - quan_huyen: district name
@@ -94,6 +95,57 @@ Rules: output ONLY the JSON object. No markdown. No explanation.\
 """
 
 _PARSE_PROMPT_TEMPLATE = "Câu hỏi: {query}"
+
+_PARSE_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "intents": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING",
+                "enum": sorted(_VALID_INTENTS),
+            },
+        },
+        "lifestyle_signals": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING",
+                "enum": sorted(_VALID_SIGNALS),
+            },
+        },
+        "filters": {
+            "type": "OBJECT",
+            "properties": {
+                "gia_trieu": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "$gte": {"type": "NUMBER"},
+                        "$lte": {"type": "NUMBER"},
+                    },
+                },
+                "dien_tich_m2": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "$gte": {"type": "NUMBER"},
+                        "$lte": {"type": "NUMBER"},
+                    },
+                },
+                "so_phong_ngu": {"type": "INTEGER"},
+                "tinh_thanh": {"type": "STRING"},
+                "quan_huyen": {"type": "STRING"},
+                "loai_nha_dat": {
+                    "type": "STRING",
+                    "enum": ["Căn hộ chung cư", "Nhà riêng", "Đất", "Nhà biệt thự, liền kề", "Shophouse"],
+                },
+                "loai_hinh": {
+                    "type": "STRING",
+                    "enum": ["ban", "cho_thue"],
+                },
+            },
+        },
+    },
+    "required": ["intents", "lifestyle_signals", "filters"],
+}
 
 
 def _repair_json(raw: str) -> Optional[str]:
@@ -158,10 +210,21 @@ def _llm_parse(query: str, llm) -> Optional[dict]:
     """Call the LLM to parse the query into structured fields. Returns dict or None."""
     prompt = _PARSE_PROMPT_TEMPLATE.format(query=query)
     try:
+        if hasattr(llm, "generate_json"):
+            parsed = llm.generate_json(
+                prompt=prompt,
+                system_prompt=_PARSE_SYSTEM_PROMPT,
+                response_schema=_PARSE_RESPONSE_SCHEMA,
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            if isinstance(parsed, dict):
+                return parsed
+
         raw = llm.generate(
             prompt=prompt,
             system_prompt=_PARSE_SYSTEM_PROMPT,
-            max_tokens=512,
+            max_tokens=1024,
             temperature=0.0,
         )
         if not raw:
@@ -194,8 +257,9 @@ _CITY_KEYWORDS = {
 }
 
 _DISTRICT_PATTERNS = [
-    r"(?:quận|quan|q\.?)\s*(\d+|[a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ\s]+)",
-    r"(?:huyện|h\.?)\s+([a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ\s]+)",
+    r"(?:\bquận\b|\bquan\b|\bq\.?)\s*(\d+|[a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ\s]+)",
+    r"(?:\bhuyện\b|\bh\.|\bh\s+)\s*([a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ\s]+)",
+    r"(?:\bthành phố\b|\btp\.)\s+([a-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ\s]+)",
 ]
 
 _PRICE_PATTERNS = [
@@ -204,6 +268,13 @@ _PRICE_PATTERNS = [
     (r"trên\s+(\d+(?:[.,]\d+)?)\s*(tỷ|ty|triệu|tr)", "gte"),
     (r"khoảng\s+(\d+(?:[.,]\d+)?)\s*(tỷ|ty|triệu|tr)", "approx"),
     (r"(\d+(?:[.,]\d+)?)\s*(tỷ|ty)(?:\s|$|,)", "lte"),
+]
+
+_AREA_PATTERNS = [
+    (r"(?:diện tích|dien tich|dt|rộng|rong)\s*(?:từ\s*)?(\d+(?:[.,]\d+)?)\s*(?:-|đến|toi|tới)\s*(\d+(?:[.,]\d+)?)\s*(?:m2|m²|mét vuông|met vuong)", "range"),
+    (r"(?:diện tích|dien tich|dt|rộng|rong)\s*(?:dưới|duoi|tối đa|toi da)\s*(\d+(?:[.,]\d+)?)\s*(?:m2|m²|mét vuông|met vuong)", "lte"),
+    (r"(?:diện tích|dien tich|dt|rộng|rong)\s*(?:trên|tren|từ|tu|tối thiểu|toi thieu)\s*(\d+(?:[.,]\d+)?)\s*(?:m2|m²|mét vuông|met vuong)", "gte"),
+    (r"(?:diện tích|dien tich|dt|rộng|rong)\s*(?:khoảng|khoang|tầm|tam)?\s*(\d+(?:[.,]\d+)?)\s*(?:m2|m²|mét vuông|met vuong)", "approx"),
 ]
 
 _BEDROOM_PATTERNS = [
@@ -216,7 +287,7 @@ _PROPERTY_TYPE_MAP = [
     ("Nhà riêng", ["nhà riêng", "nhà phố"]),
     ("Nhà biệt thự, liên kề", ["biệt thự", "liên kề", "villa"]),
     ("Nhà mặt phố", ["nhà mặt phố", "mặt tiền"]),
-    ("Đất", ["đất nền", "đất thổ cư", "lô đất"]),
+    ("Đất", ["đất bán", "bán đất", "tìm đất", "đất nền", "đất thổ cư", "lô đất"]),
     ("Phòng trọ", ["phòng trọ", "trọ"]),
     ("Shophouse", ["shophouse"]),
 ]
@@ -266,6 +337,26 @@ def _regex_extract_filters(text: str) -> dict:
             filters["gia_trieu"] = {"$gte": val * mul}
         break
 
+    # Area
+    for pattern, atype in _AREA_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+        if atype == "range":
+            low = float(m.group(1).replace(",", "."))
+            high = float(m.group(2).replace(",", "."))
+            filters["dien_tich_m2"] = {"$gte": low, "$lte": high}
+        elif atype == "lte":
+            val = float(m.group(1).replace(",", "."))
+            filters["dien_tich_m2"] = {"$lte": val}
+        elif atype == "gte":
+            val = float(m.group(1).replace(",", "."))
+            filters["dien_tich_m2"] = {"$gte": val}
+        elif atype == "approx":
+            val = float(m.group(1).replace(",", "."))
+            filters["dien_tich_m2"] = {"$gte": val * 0.9, "$lte": val * 1.1}
+        break
+
     # City
     for kw, city in {**_CITY_KEYWORDS, **CITY_ALIASES}.items():
         if kw in text:
@@ -277,8 +368,12 @@ def _regex_extract_filters(text: str) -> dict:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             d = re.sub(r"[,.\s]+$", "", m.group(1).strip().title())
-            if len(d) > 1:
-                filters["quan_huyen"] = f"Quận {d}" if d[0].isdigit() else d
+            d_norm = _strip_accents(d.lower())
+            if len(d) > 1 and d_norm not in {"ho chi minh", "ha noi", "da nang", "hai phong", "can tho"}:
+                if "thành phố" in pat:
+                    filters["quan_huyen"] = f"Thành phố {d}"
+                else:
+                    filters["quan_huyen"] = f"Quận {d}" if d[0].isdigit() else d
             break
 
     # Bedrooms
@@ -343,6 +438,17 @@ def _infer_listing_type(text: str) -> Optional[str]:
 
 def _canonicalize_filters(filters: dict) -> dict:
     filters = dict(filters or {})
+
+    for key in ("gia_trieu", "dien_tich_m2"):
+        value = filters.get(key)
+        if isinstance(value, dict):
+            normalized = {}
+            if "$gte" in value or "gte" in value or "min" in value:
+                normalized["$gte"] = value.get("$gte", value.get("gte", value.get("min")))
+            if "$lte" in value or "lte" in value or "max" in value:
+                normalized["$lte"] = value.get("$lte", value.get("lte", value.get("max")))
+            filters[key] = {k: v for k, v in normalized.items() if v is not None}
+
     prop_type = filters.get("loai_nha_dat")
     if prop_type:
         key = _strip_accents(str(prop_type).strip().lower())
@@ -461,7 +567,8 @@ class QueryParser:
             lifestyle_signals = _extract_lifestyle_signals(text)
         if any(kw in text for kw in [
             "bán nhà", "mua nhà", "thuê nhà", "cho thuê", "căn hộ",
-            "đất nền", "biệt thự", "nhà riêng", "tìm nhà",
+            "đất nền", "đất bán", "bán đất", "dat ban", "ban dat",
+            "biệt thự", "nhà riêng", "tìm nhà", "tìm đất", "tim dat",
         ]):
             intents.append("search_listing")
 

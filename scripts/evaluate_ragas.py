@@ -11,6 +11,8 @@ import argparse
 import json
 import os
 import sys
+import types
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,29 @@ try:
     load_dotenv(ROOT / ".env", override=False)
 except ImportError:
     pass
+
+
+def install_ragas_vertexai_compat() -> None:
+    """Bridge old Ragas imports to the current LangChain Vertex package.
+
+    Ragas 0.4.x still imports ChatVertexAI from:
+      langchain_community.chat_models.vertexai
+
+    Newer LangChain moved Vertex AI chat models to:
+      langchain_google_vertexai
+    """
+    legacy_module = "langchain_community.chat_models.vertexai"
+    if legacy_module in sys.modules:
+        return
+
+    try:
+        from langchain_google_vertexai import ChatVertexAI
+    except ImportError:
+        return
+
+    shim = types.ModuleType(legacy_module)
+    shim.ChatVertexAI = ChatVertexAI
+    sys.modules[legacy_module] = shim
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -53,27 +78,38 @@ def build_ragas_samples(rows: list[dict[str, Any]], max_contexts: int) -> list[d
 
 
 def import_ragas_bits(metric_names: list[str]):
+    install_ragas_vertexai_compat()
     try:
-        from ragas import EvaluationDataset, evaluate
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*langchain-community.*")
+            from ragas import EvaluationDataset, evaluate
+            from ragas.run_config import RunConfig
     except ImportError as exc:
         raise SystemExit(
-            "Missing dependency: ragas. Install evaluation deps first, for example:\n"
-            "  pip install ragas langchain-google-vertexai\n"
+            "Missing Ragas evaluation dependency. Install evaluation deps in the same Python environment first:\n"
+            "  python -m pip install -r requirements-eval.txt\n\n"
+            f"Original import error: {exc}"
         ) from exc
 
     metric_map = {}
     try:
-        from ragas.metrics import Faithfulness, LLMContextRecall, ResponseRelevancy, FactualCorrectness
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            from ragas.metrics import Faithfulness, FactualCorrectness
+            from ragas.metrics import LLMContextRecall as ContextRecall
+            from ragas.metrics import ResponseRelevancy
 
         metric_map.update({
             "faithfulness": Faithfulness,
-            "context_recall": LLMContextRecall,
+            "context_recall": ContextRecall,
             "response_relevancy": ResponseRelevancy,
             "factual_correctness": FactualCorrectness,
         })
     except ImportError:
         # Older Ragas versions expose snake_case metric instances.
-        from ragas.metrics import faithfulness, answer_relevancy, context_recall
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            from ragas.metrics import faithfulness, answer_relevancy, context_recall
 
         metric_map.update({
             "faithfulness": lambda: faithfulness,
@@ -91,27 +127,37 @@ def import_ragas_bits(metric_names: list[str]):
         metrics.append(factory())
     if unknown:
         raise SystemExit(f"Unknown/unsupported Ragas metric(s): {unknown}. Available: {sorted(metric_map)}")
-    return EvaluationDataset, evaluate, metrics
+    return EvaluationDataset, evaluate, RunConfig, metrics
 
 
 def build_vertex_judge(model: str, project: str, location: str, temperature: float):
     try:
-        from langchain_google_vertexai import ChatVertexAI
-        from ragas.llms import LangchainLLMWrapper
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            warnings.filterwarnings("ignore", category=Warning, message=".*ChatVertexAI.*")
+            warnings.filterwarnings("ignore", category=Warning, message=".*LangchainLLMWrapper.*")
+            warnings.filterwarnings("ignore", category=Warning, message=".*langchain-community.*")
+            from langchain_google_vertexai import ChatVertexAI
+            from ragas.llms import LangchainLLMWrapper
     except ImportError as exc:
         raise SystemExit(
             "Missing dependency for Gemini Vertex judge. Install:\n"
-            "  pip install langchain-google-vertexai\n"
+            "  python -m pip install -r requirements-eval.txt\n\n"
+            f"Original import error: {exc}"
         ) from exc
 
-    llm = ChatVertexAI(
-        model_name=model,
-        project=project or None,
-        location=location,
-        temperature=temperature,
-        max_output_tokens=8192,
-    )
-    return LangchainLLMWrapper(llm)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=Warning, message=".*ChatVertexAI.*")
+        warnings.filterwarnings("ignore", category=Warning, message=".*ChatGoogleGenerativeAI.*")
+        warnings.filterwarnings("ignore", category=Warning, message=".*LangchainLLMWrapper.*")
+        llm = ChatVertexAI(
+            model_name=model,
+            project=project or None,
+            location=location,
+            temperature=temperature,
+            max_output_tokens=8192,
+        )
+        return LangchainLLMWrapper(llm)
 
 
 def main() -> int:
@@ -132,6 +178,10 @@ def main() -> int:
     parser.add_argument("--judge-project", default=os.getenv("PROJECT_ID", ""))
     parser.add_argument("--judge-location", default=os.getenv("VERTEX_LOCATION", "global"))
     parser.add_argument("--judge-temperature", type=float, default=0.0)
+    parser.add_argument("--timeout", type=int, default=600, help="Ragas per-job timeout in seconds.")
+    parser.add_argument("--max-workers", type=int, default=4, help="Ragas concurrent judge jobs.")
+    parser.add_argument("--max-retries", type=int, default=3, help="Ragas retry count per failed judge job.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Ragas evaluate batch size.")
     args = parser.parse_args()
 
     rows = load_jsonl(args.input)
@@ -145,7 +195,7 @@ def main() -> int:
     if not samples:
         raise SystemExit("No Ragas samples available. Need question, answer, and retrieved_contexts.")
 
-    EvaluationDataset, evaluate, metrics = import_ragas_bits(args.metrics)
+    EvaluationDataset, evaluate, RunConfig, metrics = import_ragas_bits(args.metrics)
     dataset = EvaluationDataset.from_list(samples)
 
     if args.judge_provider == "vertexai":
@@ -158,7 +208,19 @@ def main() -> int:
     else:
         raise SystemExit(f"Unsupported judge provider: {args.judge_provider}")
 
-    result = evaluate(dataset=dataset, metrics=metrics, llm=evaluator_llm)
+    run_config = RunConfig(
+        timeout=args.timeout,
+        max_retries=args.max_retries,
+        max_workers=args.max_workers,
+    )
+    result = evaluate(
+        dataset=dataset,
+        metrics=metrics,
+        llm=evaluator_llm,
+        run_config=run_config,
+        batch_size=args.batch_size,
+        raise_exceptions=False,
+    )
 
     output = args.output or (args.input.parent / "ragas_results.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +244,10 @@ def main() -> int:
         "judge_model": args.judge_model,
         "judge_location": args.judge_location,
         "metrics": args.metrics,
+        "timeout": args.timeout,
+        "max_workers": args.max_workers,
+        "max_retries": args.max_retries,
+        "batch_size": args.batch_size,
         "aggregate": aggregate,
         "records": records,
     }

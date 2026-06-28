@@ -59,11 +59,13 @@ CÁC CÔNG CỤ BẠN CÓ:
      - `limit` (int, optional): Mặc định: 5.
 
 4. `filter_listings` (lọc danh sách tin đăng từ PostgreSQL):
-   - Dùng để tìm kiếm và lọc các tin đăng bán/cho thuê với tiêu chí chính xác (giá, số phòng ngủ, vị trí, loại nhà đất).
+   - Dùng để tìm kiếm và lọc các tin đăng bán/cho thuê với tiêu chí chính xác (giá, diện tích, số phòng ngủ, vị trí, loại nhà đất).
    - Nếu người dùng muốn tìm nhà ĐỊA DANH hoặc TỌA ĐỘ BẢN ĐỒ, HÃY DÙNG `search_location` LẤY TỌA ĐỘ TRƯỚC, SAU ĐÓ truyền `lat`, `lon` vào công cụ này.
    - Các tham số:
      - `price_max_trieu` (float, optional): Giá tối đa (triệu VND). Ví dụ: 3000 (là 3 tỷ).
      - `price_min_trieu` (float, optional): Giá tối thiểu (triệu VND).
+     - `area_max_m2` (float, optional): Diện tích tối đa theo m².
+     - `area_min_m2` (float, optional): Diện tích tối thiểu theo m².
      - `bedrooms` (int, optional): Số phòng ngủ.
      - `loai_hinh` (str, optional): "ban" nếu người dùng muốn mua/bán; "cho_thue" nếu người dùng muốn thuê/cho thuê.
      - `tinh_thanh` (str, optional): Tỉnh/Thành phố (ví dụ: "TP Hồ Chí Minh", "Hà Nội").

@@ -82,6 +82,86 @@ def expected_source_hit(expected_sources: list[dict[str, Any]], actual_sources: 
     return False
 
 
+def normalize_url(url: object) -> str:
+    return str(url or "").strip().rstrip(".,;:!?)]}>\"'")
+
+
+def extract_urls(text: str) -> list[str]:
+    import re
+
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in re.finditer(r"(?:https?://[^\s)\]}>,\"']+|hf://[^\s)\]}>,\"']+)", text or "", flags=re.I):
+        url = normalize_url(match.group(0))
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def infer_answer_behavior(answer: str, answer_package: dict[str, Any]) -> str:
+    package_behavior = str(answer_package.get("answer_behavior") or "").strip().lower()
+    if package_behavior in {"answer", "clarify", "refuse"}:
+        return package_behavior
+
+    norm = answer.lower()
+    if any(phrase in norm for phrase in ("ngoài phạm vi", "không thuộc phạm vi", "không thể hỗ trợ")):
+        return "refuse"
+    if "?" in answer or any(
+        phrase in norm
+        for phrase in (
+            "cần thêm",
+            "vui lòng cho biết",
+            "bạn muốn",
+            "cho mình biết",
+            "làm rõ",
+            "mua hay thuê",
+        )
+    ):
+        return "clarify"
+    return "answer"
+
+
+def build_answer_audit(
+    answer: str,
+    answer_package: dict[str, Any],
+    retrieved_sources: list[dict[str, Any]],
+    cited_sources: list[dict[str, Any]],
+    expected_behavior: str,
+) -> dict[str, Any]:
+    answer_urls = extract_urls(answer)
+    package_urls = [normalize_url(url) for url in (answer_package.get("used_citations") or []) if normalize_url(url)]
+    retrieved_urls = {normalize_url(source_url(source)) for source in retrieved_sources if normalize_url(source_url(source))}
+    cited_urls = {normalize_url(source_url(source)) for source in cited_sources if normalize_url(source_url(source))}
+    used_urls = []
+    seen: set[str] = set()
+    for url in [*answer_urls, *package_urls]:
+        if url and url not in seen:
+            seen.add(url)
+            used_urls.append(url)
+
+    actual_behavior = infer_answer_behavior(answer, answer_package)
+    hallucinated_urls = [url for url in used_urls if retrieved_urls and url not in retrieved_urls]
+
+    return {
+        "expected_behavior": expected_behavior,
+        "actual_behavior": actual_behavior,
+        "behavior_match": actual_behavior == expected_behavior if expected_behavior else None,
+        "answer_urls": answer_urls,
+        "package_used_citations": package_urls,
+        "used_citation_urls": used_urls,
+        "used_citation_count": len(used_urls),
+        "used_citations_in_retrieved": [url for url in used_urls if url in retrieved_urls],
+        "hallucinated_citation_urls": hallucinated_urls,
+        "cited_source_urls": sorted(cited_urls),
+        "retrieved_source_count": len(retrieved_sources),
+        "cited_source_count": len(cited_sources),
+        "missing_criteria": answer_package.get("missing_criteria") or [],
+        "follow_up_questions": answer_package.get("follow_up_questions") or [],
+        "confidence_notes": answer_package.get("confidence_notes") or [],
+    }
+
+
 def run_case(chain: Any, case: dict[str, Any], session_prefix: str, include_events: bool) -> dict[str, Any]:
     case_id = str(case.get("id") or "")
     question = str(case.get("question") or "")
@@ -126,12 +206,21 @@ def run_case(chain: Any, case: dict[str, Any], session_prefix: str, include_even
         or []
     )
     cited_sources = final_metadata.get("cited_sources") or metadata.get("cited_sources") or []
+    answer_package = final_metadata.get("answer_package") or metadata.get("answer_package") or {}
     retrieved_contexts = [str(source.get("text") or "") for source in retrieved_sources if source.get("text")]
 
     elapsed = round(time.monotonic() - started, 3)
     expected_tools = list(case.get("expected_tools_called") or [])
     tool_hit = all(tool in tool_calls for tool in expected_tools)
     source_hit = expected_source_hit(case.get("expected_sources") or [], retrieved_sources)
+    expected_behavior = str(case.get("expected_behavior") or "")
+    answer_audit = build_answer_audit(
+        answer=answer,
+        answer_package=answer_package if isinstance(answer_package, dict) else {},
+        retrieved_sources=retrieved_sources,
+        cited_sources=cited_sources,
+        expected_behavior=expected_behavior,
+    )
 
     return {
         "id": case_id,
@@ -141,7 +230,7 @@ def run_case(chain: Any, case: dict[str, Any], session_prefix: str, include_even
         "question": question,
         "reference": case.get("reference_answer", ""),
         "expected": {
-            "behavior": case.get("expected_behavior"),
+            "behavior": expected_behavior,
             "intents": case.get("expected_intents", []),
             "filters": case.get("expected_filters", {}),
             "signals": case.get("expected_signals", []),
@@ -159,6 +248,8 @@ def run_case(chain: Any, case: dict[str, Any], session_prefix: str, include_even
             "retrieved_sources": retrieved_sources,
             "cited_sources": cited_sources,
             "retrieved_contexts": retrieved_contexts,
+            "answer_package": answer_package,
+            "answer_audit": answer_audit,
         },
         "metrics_precheck": {
             "tool_hit": tool_hit,
@@ -179,10 +270,16 @@ def summarize(results_path: Path) -> dict[str, Any]:
     by_category: dict[str, dict[str, Any]] = {}
     for row in rows:
         category = row.get("category", "")
-        bucket = by_category.setdefault(category, {"total": 0, "tool_hits": 0, "source_hits": 0, "errors": 0})
+        bucket = by_category.setdefault(
+            category,
+            {"total": 0, "tool_hits": 0, "source_hits": 0, "behavior_matches": 0, "citation_hallucination_rows": 0, "errors": 0},
+        )
+        audit = row.get("actual", {}).get("answer_audit", {})
         bucket["total"] += 1
         bucket["tool_hits"] += int(bool(row.get("metrics_precheck", {}).get("tool_hit")))
         bucket["source_hits"] += int(bool(row.get("metrics_precheck", {}).get("expected_source_hit")))
+        bucket["behavior_matches"] += int(audit.get("behavior_match") is True)
+        bucket["citation_hallucination_rows"] += int(bool(audit.get("hallucinated_citation_urls")))
         bucket["errors"] += int(bool(row.get("metrics_precheck", {}).get("error")))
 
     return {
@@ -194,6 +291,13 @@ def summarize(results_path: Path) -> dict[str, Any]:
         "expected_source_hit_rate": (
             sum(int(bool(row.get("metrics_precheck", {}).get("expected_source_hit"))) for row in rows) / total
             if total else 0
+        ),
+        "behavior_match_rate": (
+            sum(int(row.get("actual", {}).get("answer_audit", {}).get("behavior_match") is True) for row in rows) / total
+            if total else 0
+        ),
+        "citation_hallucination_rows": sum(
+            int(bool(row.get("actual", {}).get("answer_audit", {}).get("hallucinated_citation_urls"))) for row in rows
         ),
         "error_count": sum(int(bool(row.get("metrics_precheck", {}).get("error"))) for row in rows),
         "by_category": by_category,

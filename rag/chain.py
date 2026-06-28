@@ -451,6 +451,33 @@ def _fmt_vnd(value: float) -> str:
 
 _CITATION_URL_RE = re.compile(r"(?:https?://[^\s)\]}>,\"']+|hf://[^\s)\]}>,\"']+)", re.IGNORECASE)
 
+_ANSWER_AUDIT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "used_citations": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+        },
+        "missing_criteria": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+        },
+        "follow_up_questions": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+        },
+        "confidence_notes": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+        },
+        "answer_behavior": {
+            "type": "STRING",
+            "enum": ["answer", "clarify", "refuse"],
+        },
+    },
+    "required": ["used_citations", "missing_criteria", "follow_up_questions", "confidence_notes", "answer_behavior"],
+}
+
 
 def _normalize_citation_url(url: object) -> str:
     return str(url or "").strip().rstrip(".,;:!?)]}>\"'")
@@ -494,6 +521,7 @@ class RAGChain:
         self._agent_sources = []
         self._current_parsed: Optional[ParsedQuery] = None
         self._conversations: dict[str, ConversationState] = {}
+        self._last_answer_package: dict[str, Any] = {}
 
         # Optional warm-up. Keep disabled by default so keyword/tools/UI can
         # start even when the embedding model is not cached locally yet.
@@ -674,6 +702,16 @@ class RAGChain:
             if price_min is not None:
                 clauses.append("gia_trieu >= %s")
                 params.append(float(price_min))
+
+            area_max = kwargs.get("area_max_m2") or kwargs.get("dien_tich_max_m2")
+            if area_max is not None:
+                clauses.append("dien_tich_m2 <= %s")
+                params.append(float(area_max))
+
+            area_min = kwargs.get("area_min_m2") or kwargs.get("dien_tich_min_m2")
+            if area_min is not None:
+                clauses.append("dien_tich_m2 >= %s")
+                params.append(float(area_min))
                 
             bedrooms = kwargs.get("bedrooms")
             if bedrooms is not None:
@@ -697,7 +735,7 @@ class RAGChain:
                 params.append(f"%{quan_huyen}%")
                 params.append(f"%{quan_huyen}%")
                 
-            prop_type = kwargs.get("property_type")
+            prop_type = kwargs.get("property_type") or kwargs.get("loai_nha_dat")
             if prop_type:
                 clauses.append("loai_nha_dat ILIKE %s")
                 params.append(f"%{prop_type}%")
@@ -1846,11 +1884,14 @@ class RAGChain:
                 parameters_json_schema=obj({
                     "price_max_trieu": {"type": "number"},
                     "price_min_trieu": {"type": "number"},
+                    "area_max_m2": {"type": "number"},
+                    "area_min_m2": {"type": "number"},
                     "bedrooms": {"type": "integer"},
                     "loai_hinh": {"type": "string", "enum": ["ban", "cho_thue"]},
                     "tinh_thanh": {"type": "string"},
                     "quan_huyen": {"type": "string"},
                     "property_type": {"type": "string"},
+                    "loai_nha_dat": {"type": "string"},
                     "lat": {"type": "number"},
                     "lon": {"type": "number"},
                     "radius_km": {"type": "number"},
@@ -2087,6 +2128,130 @@ class RAGChain:
                 cited_sources.append(source)
         return cited_sources
 
+    def _cited_serialized_sources_from_urls(
+        self,
+        used_urls: list[str],
+        sources: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not used_urls:
+            return []
+
+        by_url: dict[str, dict[str, Any]] = {}
+        for source in sources:
+            meta = source.get("metadata") or {}
+            url = _normalize_citation_url(
+                source.get("url") or meta.get("url") or meta.get("source_url") or meta.get("source")
+            )
+            if url and url not in by_url:
+                by_url[url] = source
+
+        cited_sources: list[dict[str, Any]] = []
+        for raw_url in used_urls:
+            cited_url = _normalize_citation_url(raw_url)
+            source = by_url.get(cited_url)
+            if source is None:
+                source = next((item for url, item in by_url.items() if cited_url in url or url in cited_url), None)
+            if source is not None and source not in cited_sources:
+                cited_sources.append(source)
+        return cited_sources
+
+    def _fallback_answer_package(
+        self,
+        answer: str,
+        parsed: ParsedQuery,
+        behavior: str = "answer",
+        missing_criteria: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        questions = re.findall(r"[^?\n]+\?", answer or "")
+        cited_urls = self._extract_cited_urls(answer)
+        return {
+            "answer_markdown": answer.strip(),
+            "used_citations": cited_urls,
+            "missing_criteria": missing_criteria or [],
+            "follow_up_questions": [q.strip() for q in questions[:5]],
+            "confidence_notes": [],
+            "answer_behavior": behavior,
+            "intent": parsed.intent,
+        }
+
+    def _normalize_answer_package(self, package: Any, parsed: ParsedQuery, fallback_answer: str = "") -> dict[str, Any]:
+        if not isinstance(package, dict):
+            return self._fallback_answer_package(fallback_answer, parsed)
+
+        answer_markdown = str(package.get("answer_markdown") or fallback_answer or "").strip()
+        behavior = str(package.get("answer_behavior") or "answer").strip().lower()
+        if behavior not in {"answer", "clarify", "refuse"}:
+            behavior = "answer"
+
+        normalized = {
+            "answer_markdown": answer_markdown,
+            "used_citations": [
+                _normalize_citation_url(url)
+                for url in (package.get("used_citations") or [])
+                if _normalize_citation_url(url)
+            ],
+            "missing_criteria": [str(item).strip() for item in (package.get("missing_criteria") or []) if str(item).strip()],
+            "follow_up_questions": [str(item).strip() for item in (package.get("follow_up_questions") or []) if str(item).strip()],
+            "confidence_notes": [str(item).strip() for item in (package.get("confidence_notes") or []) if str(item).strip()],
+            "answer_behavior": behavior,
+            "intent": parsed.intent,
+        }
+        if not normalized["used_citations"]:
+            normalized["used_citations"] = self._extract_cited_urls(answer_markdown)
+        return normalized
+
+    def _audit_answer_package(
+        self,
+        answer: str,
+        user_query: str,
+        parsed: ParsedQuery,
+        source_urls: list[str],
+    ) -> dict[str, Any]:
+        """Extract compact structured metadata from a completed Markdown answer."""
+        fallback = self._fallback_answer_package(answer, parsed)
+        if not _env_flag("RAG_ENABLE_ANSWER_AUDIT", True):
+            return fallback
+        if not self._llm.is_available or not hasattr(self._llm, "generate_json"):
+            return fallback
+
+        prompt = (
+            "Hãy đọc câu hỏi và câu trả lời đã hoàn tất, rồi trích xuất metadata JSON ngắn gọn. "
+            "Không viết lại câu trả lời. Không thêm URL không xuất hiện trong câu trả lời hoặc danh sách nguồn hợp lệ.\n\n"
+            f"Câu hỏi: {user_query}\n\n"
+            f"Intent: {parsed.intent}\n"
+            f"Bộ lọc: {json.dumps(parsed.filters, ensure_ascii=False)}\n\n"
+            f"Câu trả lời Markdown:\n{answer[:8000]}\n\n"
+            f"URL nguồn hợp lệ: {json.dumps(source_urls[:30], ensure_ascii=False)}\n\n"
+            "Quy ước answer_behavior: `answer` nếu đã trả lời, `clarify` nếu chủ yếu hỏi làm rõ, "
+            "`refuse` nếu từ chối do ngoài phạm vi."
+        )
+        package = self._llm.generate_json(
+            prompt=prompt,
+            system_prompt="Bạn là bộ trích xuất metadata đánh giá RAG. Chỉ xuất JSON theo schema.",
+            response_schema=_ANSWER_AUDIT_SCHEMA,
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        if not package:
+            return fallback
+
+        normalized = self._normalize_answer_package(
+            {
+                **package,
+                "answer_markdown": answer,
+            },
+            parsed,
+            answer,
+        )
+        valid_urls = set(source_urls)
+        normalized["used_citations"] = [
+            url for url in normalized.get("used_citations", [])
+            if url in valid_urls or url in self._extract_cited_urls(answer)
+        ]
+        if not normalized["used_citations"]:
+            normalized["used_citations"] = fallback.get("used_citations", [])
+        return normalized
+
     def _unique_agent_sources(self) -> list[RetrievedDocument]:
         seen_urls = set()
         unique_sources = []
@@ -2110,6 +2275,7 @@ class RAGChain:
         from google.genai import types
 
         self._agent_sources = []
+        self._last_answer_package = {}
         effective_query = self._prepare_query_for_session(user_query, session_id)
         parsed = self._parser.parse(effective_query)
         self._current_parsed = parsed
@@ -2298,6 +2464,12 @@ class RAGChain:
 
         if self._should_ask_clarification_only(parsed, final_answer):
             final_answer = self._format_clarification_only_answer(parsed)
+            self._last_answer_package = self._fallback_answer_package(
+                final_answer,
+                parsed,
+                behavior="clarify",
+                missing_criteria=self._clarification_questions(parsed),
+            )
             self._trace(
                 "native_clarification_only",
                 trace_id=trace_id,
@@ -2318,7 +2490,16 @@ class RAGChain:
         )
         yield {"type": "status", "text": "✍️ Đang tạo câu trả lời..."}
         yield {"type": "chunk", "text": final_answer}
+        answer_package = self._normalize_answer_package(self._last_answer_package, parsed, final_answer)
+        self._last_answer_package = answer_package
         cited_sources = self._cited_serialized_sources(final_answer, serialized_sources)
+        cited_by_package = self._cited_serialized_sources_from_urls(
+            answer_package.get("used_citations", []),
+            serialized_sources,
+        )
+        for source in cited_by_package:
+            if source not in cited_sources:
+                cited_sources.append(source)
         yield {
             "type": "final_metadata",
             "intent": parsed.intent,
@@ -2327,6 +2508,7 @@ class RAGChain:
             "used_conversation_memory": effective_query != user_query,
             "retrieved_sources": serialized_sources,
             "cited_sources": cited_sources,
+            "answer_package": answer_package,
         }
         yield {"type": "done"}
 
@@ -2594,12 +2776,26 @@ class RAGChain:
     ) -> str:
         """Create a final user-facing answer from accumulated tool sources."""
         if self._should_ask_clarification_only(parsed, draft):
-            return self._format_clarification_only_answer(parsed)
+            answer = self._format_clarification_only_answer(parsed)
+            self._last_answer_package = self._fallback_answer_package(
+                answer,
+                parsed,
+                behavior="clarify",
+                missing_criteria=self._clarification_questions(parsed),
+            )
+            return answer
 
         if not self._llm.is_available:
-            return draft.strip() or "Tôi chưa có đủ thông tin để trả lời chính xác."
+            answer = draft.strip() or "Tôi chưa có đủ thông tin để trả lời chính xác."
+            self._last_answer_package = self._fallback_answer_package(answer, parsed)
+            return answer
 
         context = format_context(self._agent_sources, max_chars=12000)
+        source_urls = [
+            _normalize_citation_url(getattr(doc, "metadata", {}).get("url", ""))
+            for doc in self._agent_sources
+            if _normalize_citation_url(getattr(doc, "metadata", {}).get("url", ""))
+        ][:30]
         prompt = (
             f"Câu hỏi của người dùng: {user_query}\n\n"
             f"Intent đã phân tích: {parsed.intent}\n"
@@ -2608,22 +2804,30 @@ class RAGChain:
         )
         if draft.strip():
             prompt += f"Ghi chú/draft từ vòng ReAct:\n{draft.strip()}\n\n"
-        prompt += (
+        answer_prompt = prompt + (
             "Hãy viết câu trả lời cuối cùng bằng tiếng Việt, định dạng Markdown. "
             "Không nhắc lại Thought/Action/Observation. "
             "Chỉ dựa trên dữ liệu đã tra cứu; nếu thiếu dữ liệu cho tiêu chí nào "
             "(ví dụ ít ngập/yên tĩnh), ghi rõ mức độ chắc chắn. "
-            "Ưu tiên gợi ý 2-3 lựa chọn phù hợp nhất, nêu rõ: giá, diện tích, vị trí, "
-            "gần metro/trường học nếu có dữ liệu, nhận xét về yên tĩnh/ngập nước nếu có bằng chứng, "
-            "và kèm URL nguồn."
+            "Ưu tiên gợi ý 2-3 lựa chọn phù hợp nhất, nêu rõ giá, diện tích, vị trí, "
+            "gần metro/trường học nếu có dữ liệu, nhận xét về yên tĩnh/ngập nước nếu có bằng chứng. "
+            "Nếu dùng nguồn nào, URL nguồn phải xuất hiện trực tiếp trong câu trả lời. "
+            f"Các URL nguồn hợp lệ đã tra cứu: {json.dumps(source_urls, ensure_ascii=False)}"
         )
         answer = self._llm.generate(
-            prompt=prompt,
+            prompt=answer_prompt,
             system_prompt=SYSTEM_PROMPT,
             max_tokens=4096,
             temperature=_chat_answer_temperature(),
         )
-        return answer.strip() if answer else (draft.strip() or "Tôi chưa có đủ thông tin để trả lời chính xác.")
+        answer = answer.strip() if answer else (draft.strip() or "Tôi chưa có đủ thông tin để trả lời chính xác.")
+        self._last_answer_package = self._audit_answer_package(
+            answer=answer,
+            user_query=user_query,
+            parsed=parsed,
+            source_urls=source_urls,
+        )
+        return answer
 
     # ---------------------------------------------------------------------------
     # ReAct Agent loop implementation
@@ -2659,6 +2863,7 @@ class RAGChain:
         
         # Reset retrieved sources cache
         self._agent_sources = []
+        self._last_answer_package = {}
         effective_query = self._prepare_query_for_session(user_query, session_id)
         trace_id = uuid.uuid4().hex[:12]
         
@@ -2878,6 +3083,7 @@ class RAGChain:
             return
 
         self._agent_sources = []
+        self._last_answer_package = {}
         effective_query = self._prepare_query_for_session(user_query, session_id)
         parsed = self._parser.parse(effective_query)
         self._current_parsed = parsed
@@ -3059,6 +3265,13 @@ class RAGChain:
 
             if self._should_ask_clarification_only(parsed, raw_final):
                 clarification_answer = self._format_clarification_only_answer(parsed)
+                answer_package = self._fallback_answer_package(
+                    clarification_answer,
+                    parsed,
+                    behavior="clarify",
+                    missing_criteria=self._clarification_questions(parsed),
+                )
+                self._last_answer_package = answer_package
                 self._remember_or_clear_conversation(session_id, effective_query, parsed, clarification_answer)
                 self._trace(
                     "clarification_only",
@@ -3079,6 +3292,7 @@ class RAGChain:
                     "used_conversation_memory": effective_query != user_query,
                     "retrieved_sources": serialized_sources,
                     "cited_sources": self._cited_serialized_sources(clarification_answer, serialized_sources),
+                    "answer_package": answer_package,
                 }
                 yield {"type": "done"}
                 return
@@ -3109,6 +3323,8 @@ class RAGChain:
                 yield {"type": "chunk", "text": token}
 
             streamed_answer = "".join(streamed_answer_parts)
+            answer_package = self._fallback_answer_package(streamed_answer, parsed)
+            self._last_answer_package = answer_package
             self._trace(
                 "final_stream_done",
                 trace_id=trace_id,
@@ -3126,6 +3342,7 @@ class RAGChain:
                 "used_conversation_memory": effective_query != user_query,
                 "retrieved_sources": serialized_sources,
                 "cited_sources": self._cited_serialized_sources(streamed_answer, serialized_sources),
+                "answer_package": answer_package,
             }
             yield {"type": "done"}
 
@@ -3137,6 +3354,8 @@ class RAGChain:
                 documents=[],
                 intent=parsed.intent
             )
+            answer_package = self._fallback_answer_package(fallback_text, parsed)
+            self._last_answer_package = answer_package
             self._trace(
                 "offline_fallback",
                 trace_id=trace_id,
@@ -3159,6 +3378,7 @@ class RAGChain:
                 "filters": parsed.filters,
                 "retrieved_sources": [],
                 "cited_sources": [],
+                "answer_package": answer_package,
             }
             yield {"type": "done"}
 
