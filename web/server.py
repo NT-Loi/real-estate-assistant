@@ -21,10 +21,16 @@ import uvicorn
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+try:
+    from db.config import DATA_DIR as CONFIG_DATA_DIR
+except Exception:
+    CONFIG_DATA_DIR = ROOT / "data"
+
+DATA_DIR = Path(CONFIG_DATA_DIR)
 
 RAG_CHAIN = None
 RAG_INIT_ERROR = None
@@ -146,11 +152,24 @@ def approximate_coords(record: dict) -> tuple[float, float, str]:
     dlat, dlng = stable_offset(record.get("url") or record.get("tieu_de") or "")
     return base[0] + dlat, base[1] + dlng, "approximate"
 
+def normalize_listing_type(value: object, filename: str = "") -> str:
+    text = str(value or "").strip().lower().replace("_", "-")
+    if text in {"cho-thue", "thue", "rental", "rent"}:
+        return "cho-thue"
+    if text in {"ban", "bán", "sale"}:
+        return "ban"
+    if "cho_thue" in filename or "cho-thue" in filename:
+        return "cho-thue"
+    if "ban" in filename:
+        return "ban"
+    return text
+
 def load_listings() -> list[dict]:
     rows: list[dict] = []
     for filename in ("listings_ban.json", "listings_cho_thue.json"):
         path = DATA_DIR / filename
         if not path.exists():
+            log.warning(f"Listing source not found: {path}")
             continue
         records = json.loads(path.read_text(encoding="utf-8"))
         for idx, record in enumerate(records):
@@ -158,10 +177,11 @@ def load_listings() -> list[dict]:
             lat, lng, precision = approximate_coords(record)
             price = price_vnd(record.get("gia"))
             area = parse_number(record.get("dien_tich"))
+            listing_type = normalize_listing_type(record.get("loai_hinh"), filename)
             rows.append(
                 {
-                    "id": f"{record.get('loai_hinh', 'listing')}-{idx}",
-                    "listing_type": record.get("loai_hinh") or "",
+                    "id": f"{listing_type or 'listing'}-{idx}",
+                    "listing_type": listing_type,
                     "property_type": record.get("loai_nha_dat") or "Chưa phân loại",
                     "title": record.get("tieu_de") or "",
                     "address": first_line(record.get("dia_chi") or record.get("khu_vuc")),
@@ -194,7 +214,7 @@ def listing_stats(rows: list[dict]) -> dict:
     return {
         "count": len(rows),
         "sale_count": sum(1 for r in rows if r["listing_type"] == "ban"),
-        "rent_count": sum(1 for r in rows if r["listing_type"] in {"cho_thue", "cho-thue"}),
+        "rent_count": sum(1 for r in rows if r["listing_type"] == "cho-thue"),
         "median_price_vnd": sorted(priced)[len(priced) // 2] if priced else None,
         "avg_area_m2": round(sum(areas) / len(areas), 1) if areas else None,
         "approximate_geo_count": sum(1 for r in rows if r["geo_precision"] == "approximate"),
@@ -422,12 +442,14 @@ def serialize_source(doc) -> dict:
         "url": url,
     }
 
-def listings_from_sources(sources: list[dict], fallback_query: str) -> list[dict]:
+def listings_from_sources(sources: list[dict], fallback_query: str, allow_fallback: bool = True) -> list[dict]:
     source_urls = {source.get("url") for source in sources if source.get("url")}
     if source_urls:
         matched = [item for item in LISTINGS if item.get("url") in source_urls]
         if matched:
             return matched
+    if not allow_fallback:
+        return []
     return local_listing_search(fallback_query)
 
 # Setup FastAPI App
@@ -472,7 +494,7 @@ def get_listings(
     bedrooms: int = None,
     bathrooms: int = None,
     sort_by: str = None,
-    limit: int = 500
+    limit: Optional[int] = 500
 ):
     rows = LISTINGS
     if listing_type:
@@ -507,7 +529,17 @@ def get_listings(
     elif sort_by == "area_desc":
         rows = sorted(rows, key=lambda x: x.get("area_m2") or -float('inf'), reverse=True)
         
-    return {"items": rows[:limit], "stats": listing_stats(rows)}
+    if limit is None or limit <= 0:
+        items = rows
+    else:
+        items = rows[:limit]
+
+    return {
+        "items": items,
+        "stats": listing_stats(rows),
+        "total": len(rows),
+        "returned": len(items),
+    }
 
 @app.get("/api/stats")
 def get_stats():
@@ -569,26 +601,32 @@ def chat(payload: ChatRequest):
 
                 if etype == "metadata":
                     sources = event.get("sources", [])
-                    # Compute matching map listings immediately
+                    # Keep retrieved candidates for diagnostics/evaluation, but
+                    # do not render them as citations before the final answer
+                    # declares which URLs were actually used.
                     mapped_listings = listings_from_sources(sources, message)
                     meta_payload = {
                         "intent": event.get("intent", ""),
                         "filters_applied": event.get("filters", {}),
-                        "sources": sources,
+                        "sources": [],
                         "retrieved_sources": event.get("retrieved_sources", sources),
                         "cited_sources": event.get("cited_sources", []),
-                        "listings": mapped_listings,
+                        "listings": [],
+                        "retrieved_listings": mapped_listings,
                         "llm_used": True,
                     }
                     yield f"event: metadata\ndata: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
 
                 elif etype == "final_metadata":
                     cited_sources = event.get("cited_sources", [])
+                    cited_listings = listings_from_sources(cited_sources, message, allow_fallback=False) if cited_sources else []
                     final_payload = {
                         "intent": event.get("intent", ""),
                         "filters_applied": event.get("filters", {}),
+                        "sources": cited_sources,
                         "retrieved_sources": event.get("retrieved_sources", []),
                         "cited_sources": cited_sources,
+                        "listings": cited_listings,
                         "llm_used": True,
                     }
                     yield f"event: final_metadata\ndata: {json.dumps(final_payload, ensure_ascii=False)}\n\n"

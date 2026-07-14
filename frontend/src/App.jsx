@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { marked } from 'marked';
 
 const getLeaflet = () => window.L;
+const LISTING_CARD_LIMIT = 250;
 
 const getChatSessionId = () => {
   const existing = localStorage.getItem('bds-chat-session-id');
@@ -289,7 +290,7 @@ export default function App() {
   useEffect(() => {
     async function loadCatalog() {
       try {
-        const res = await fetch('/api/listings');
+        const res = await fetch('/api/listings?limit=0');
         const payload = await res.json();
         const items = payload.items || [];
         setAllListings(items);
@@ -335,7 +336,7 @@ export default function App() {
   useEffect(() => {
     const L = getLeaflet();
     if (!L || mapRef.current) return;
-    const leafletMap = L.map('map', { zoomControl: false }).setView([10.7769, 106.7009], 12);
+    const leafletMap = L.map('map', { zoomControl: false, preferCanvas: true }).setView([10.7769, 106.7009], 12);
     L.control.zoom({ position: 'bottomright' }).addTo(leafletMap);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
@@ -366,9 +367,9 @@ export default function App() {
 
     listings.forEach((item) => {
       if (!item.lat || !item.lng) return;
-      const iconClass = item.id === activeId ? 'pin-marker active' : 'pin-marker';
-      const rentClass = item.listing_type === 'cho-thue' ? ' rent' : '';
-      const iconChar = item.listing_type === 'cho-thue' ? '<i class="fa-solid fa-key"></i>' : '<i class="fa-solid fa-house"></i>';
+      const isActive = item.id === activeId;
+      const isRent = item.listing_type === 'cho-thue';
+      const markerColor = isRent ? '#2f7dd1' : '#d25b3f';
       const popupHtml = `
         <div class="map-popup">
           <h3>${escapeHtml(item.title || 'Tin đăng')}</h3>
@@ -382,14 +383,14 @@ export default function App() {
         </div>
       `;
 
-      const customIcon = L.divIcon({
-        className: '',
-        html: `<div class="${iconClass}${rentClass}">${iconChar}</div>`,
-        iconSize: [32, 32],
-        iconAnchor: [16, 32],
-        popupAnchor: [0, -32],
-      });
-      const marker = L.marker([item.lat, item.lng], { icon: customIcon })
+      const marker = L.circleMarker([item.lat, item.lng], {
+        radius: isActive ? 8 : 5,
+        color: isActive ? '#111827' : markerColor,
+        fillColor: markerColor,
+        fillOpacity: isActive ? 0.95 : 0.72,
+        opacity: 0.95,
+        weight: isActive ? 3 : 1,
+      })
         .bindPopup(popupHtml)
         .on('click', () => handleSelectListing(item.id, false));
       marker.addTo(markerLayerRef.current);
@@ -485,6 +486,7 @@ export default function App() {
   }, [pendingFitMap, listings, handleFitMap]);
 
   const activeListing = useMemo(() => allListings.find((listing) => listing.id === activeId), [allListings, activeId]);
+  const visibleListingCards = useMemo(() => listings.slice(0, LISTING_CARD_LIMIT), [listings]);
 
   const loanPrincipal = (activeListing?.price_vnd || 0) * (1 - downPaymentPct / 100);
   const monthlyInterestRate = (Number(interestRate) / 100) / 12;
@@ -570,6 +572,30 @@ export default function App() {
               return updated;
             });
             setRagStatus({ label: meta.error ? 'Fallback' : 'RAG', isError: Boolean(meta.error) });
+            if (meta.listings?.length) {
+              const ids = new Set(meta.listings.map((listing) => listing.id));
+              setLastChatListings(allListings.filter((item) => ids.has(item.id)));
+            } else {
+              setLastChatListings(null);
+            }
+          } else if (eventType === 'final_metadata') {
+            const meta = JSON.parse(dataStr);
+            setChatMessages((prev) => {
+              const updated = [...prev];
+              const lastIdx = updated.length - 1;
+              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                updated[lastIdx] = {
+                  ...updated[lastIdx],
+                  payload: {
+                    ...(updated[lastIdx].payload || {}),
+                    ...meta,
+                    sources: meta.cited_sources || meta.sources || [],
+                  },
+                  isError: Boolean(meta.error),
+                };
+              }
+              return updated;
+            });
             if (meta.listings?.length) {
               const ids = new Set(meta.listings.map((listing) => listing.id));
               setLastChatListings(allListings.filter((item) => ids.has(item.id)));
@@ -738,7 +764,7 @@ export default function App() {
                         {msg.payload.listings?.length > 0 && (
                           <div className="recommendations-panel">
                             <div className="recommendations-heading">
-                              <span><i className="fa-solid fa-house-circle-check" /> BĐS được truy xuất</span>
+                              <span><i className="fa-solid fa-house-circle-check" /> BĐS được trích dẫn</span>
                               <button type="button" className="btn-soft" onClick={handleFocusRAGListings}>
                                 <i className="fa-solid fa-map-location-dot" /> Ghim {msg.payload.listings.length} tin
                               </button>
@@ -758,7 +784,7 @@ export default function App() {
                         {msg.payload.sources?.length > 0 && (
                           <>
                             <div className="sources-carousel-title">
-                              <i className="fa-solid fa-book-open" /> Tài liệu tham khảo RAG
+                              <i className="fa-solid fa-book-open" /> Nguồn được trích dẫn
                             </div>
                             <div className="sources-carousel">
                               {msg.payload.sources.map((source, sIdx) => {
@@ -814,7 +840,7 @@ export default function App() {
             <header className="panel-header">
               <div>
                 <h2>Tìm kiếm & Bộ lọc</h2>
-                <p>Hiển thị {listings.length} bất động sản khớp với bối cảnh hiện tại.</p>
+                <p>Bản đồ đang ghim {listings.length} bất động sản khớp với bối cảnh hiện tại.</p>
               </div>
               <button type="button" className="btn-icon" onClick={handleFitMap} title="Căn chỉnh bản đồ">
                 <i className="fa-solid fa-expand" />
@@ -904,16 +930,24 @@ export default function App() {
                   <i className="fa-solid fa-house-circle-xmark" /> Không có tin đăng nào khớp với bộ lọc của bạn.
                 </div>
               ) : (
-                listings.map((item) => (
-                  <ListingCard
-                    key={item.id}
-                    item={item}
-                    active={item.id === activeId}
-                    onSelect={handleSelectListing}
-                    onCompare={toggleCompare}
-                    selectedForCompare={compareList.some((candidate) => candidate.id === item.id)}
-                  />
-                ))
+                <>
+                  {listings.length > LISTING_CARD_LIMIT && (
+                    <div className="listing-list-note">
+                      <i className="fa-solid fa-circle-info" />
+                      Đang liệt kê {LISTING_CARD_LIMIT} tin đầu tiên để giữ giao diện mượt; bản đồ vẫn ghim đủ {listings.length} tin.
+                    </div>
+                  )}
+                  {visibleListingCards.map((item) => (
+                    <ListingCard
+                      key={item.id}
+                      item={item}
+                      active={item.id === activeId}
+                      onSelect={handleSelectListing}
+                      onCompare={toggleCompare}
+                      selectedForCompare={compareList.some((candidate) => candidate.id === item.id)}
+                    />
+                  ))}
+                </>
               )}
             </div>
           </section>

@@ -296,6 +296,24 @@
     padding: 3px 7px;
   }
 
+  .listing-list-note {
+    border: 1px solid hsl(var(--border-raw));
+    border-radius: 8px;
+    background-color: hsl(var(--bg-app-raw));
+    color: hsl(var(--text-muted-raw));
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 10px 12px;
+  }
+
+  .listing-list-note i {
+    color: hsl(var(--primary-raw));
+    margin-top: 2px;
+  }
+
   .decision-dashboard {
     gap: 14px;
   }

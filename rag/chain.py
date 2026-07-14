@@ -1834,7 +1834,7 @@ class RAGChain:
         else:
             return f"Lỗi: Không tìm thấy công cụ tên là '{tool_name}'."
 
-    def _native_tool_declarations(self) -> list[Any]:
+    def _native_tool_declarations(self, allowed_names: Optional[set[str]] = None) -> list[Any]:
         """Build Gemini native function declarations for the local RAG tools."""
         from google.genai import types
 
@@ -2013,7 +2013,38 @@ class RAGChain:
                 }),
             ),
         ]
+        if allowed_names:
+            declarations = [
+                declaration
+                for declaration in declarations
+                if str(getattr(declaration, "name", "")) in allowed_names
+            ]
         return [types.Tool(function_declarations=declarations)]
+
+    def _allowed_native_tool_names(self, parsed: ParsedQuery) -> set[str]:
+        """Keep Gemini's tool choice small for faster and more reliable planning."""
+        intents = set(parsed.intents or [])
+        if "calculate_finance" in intents:
+            return {"calculate_finance"}
+        if "market_report" in intents:
+            return {"get_market_statistics", "analyze_market_trend"}
+        if "search_listing" in intents and "lifestyle_search" not in intents:
+            return {"filter_listings", "hybrid_search", "keyword_search"}
+        if "lifestyle_search" in intents:
+            return {
+                "hybrid_search",
+                "filter_listings",
+                "find_listings_near_pois",
+                "find_pois_near_location",
+                "search_pois",
+                "search_location",
+                "web_search",
+                "web_research",
+                "read_url",
+            }
+        if "compare_project" in intents:
+            return {"hybrid_search", "semantic_search", "web_search", "web_research", "read_url"}
+        return {"hybrid_search", "semantic_search", "keyword_search", "web_search", "web_research", "read_url"}
 
     def _extract_native_function_calls(self, response: Any) -> list[Any]:
         calls = list(getattr(response, "function_calls", None) or [])
@@ -2265,6 +2296,145 @@ class RAGChain:
                 unique_sources.append(doc)
         return unique_sources
 
+    def _is_direct_structured_listing_query(self, parsed: ParsedQuery) -> bool:
+        """Use deterministic SQL filtering for simple listing searches."""
+        intents = set(parsed.intents or [])
+        if "search_listing" not in intents:
+            return False
+        if intents & {"lifestyle_search", "compare_project", "market_report", "calculate_finance"}:
+            return False
+        if parsed.lifestyle_signals:
+            return False
+
+        filters = parsed.filters or {}
+        strong_fields = {
+            "loai_hinh",
+            "loai_nha_dat",
+            "tinh_thanh",
+            "quan_huyen",
+            "gia_trieu",
+            "dien_tich_m2",
+            "so_phong_ngu",
+        }
+        return sum(1 for key in strong_fields if key in filters) >= 2
+
+    def _filter_args_from_parsed(self, parsed: ParsedQuery, limit: int = 10) -> dict[str, Any]:
+        """Translate parser filter schema to filter_listings tool arguments."""
+        filters = parsed.filters or {}
+        args: dict[str, Any] = {"limit": limit}
+
+        price = filters.get("gia_trieu")
+        if isinstance(price, dict):
+            if price.get("$gte") is not None:
+                args["price_min_trieu"] = price["$gte"]
+            if price.get("$lte") is not None:
+                args["price_max_trieu"] = price["$lte"]
+
+        area = filters.get("dien_tich_m2")
+        if isinstance(area, dict):
+            if area.get("$gte") is not None:
+                args["area_min_m2"] = area["$gte"]
+            if area.get("$lte") is not None:
+                args["area_max_m2"] = area["$lte"]
+
+        if filters.get("so_phong_ngu") is not None:
+            args["bedrooms"] = filters["so_phong_ngu"]
+
+        for src, dst in (
+            ("loai_hinh", "loai_hinh"),
+            ("tinh_thanh", "tinh_thanh"),
+            ("quan_huyen", "quan_huyen"),
+            ("loai_nha_dat", "loai_nha_dat"),
+        ):
+            if filters.get(src):
+                args[dst] = filters[src]
+        return args
+
+    def _format_direct_listing_answer(self, parsed: ParsedQuery, limit: int = 5) -> str:
+        """Create a fast deterministic answer for direct listing filters."""
+        if not self._agent_sources:
+            return (
+                "Mình chưa tìm thấy tin đăng nào khớp chính xác với các bộ lọc hiện tại.\n\n"
+                "Bạn có thể nới khoảng giá, khu vực hoặc số phòng ngủ để mình tìm rộng hơn."
+            )
+
+        lines = ["Mình tìm thấy một số tin đăng khớp với bộ lọc của bạn:"]
+        for idx, doc in enumerate(self._agent_sources[:limit], start=1):
+            record = doc.record or {}
+            title = record.get("tieu_de") or "Tin đăng"
+            price = record.get("gia") or "Thỏa thuận"
+            area = record.get("dien_tich") or "chưa rõ diện tích"
+            address = record.get("dia_chi") or record.get("khu_vuc") or "chưa rõ địa chỉ"
+            bedrooms = record.get("so_phong_ngu")
+            bedroom_text = f", {bedrooms} PN" if bedrooms not in (None, "", 0) else ""
+            url = record.get("url") or doc.metadata.get("url") or ""
+            lines.append(
+                f"{idx}. {title}\n"
+                f"   Giá: {price}; diện tích: {area}{bedroom_text}.\n"
+                f"   Địa chỉ: {address}.\n"
+                f"   Nguồn: {url or 'chưa có URL'}"
+            )
+
+        if len(self._agent_sources) > limit:
+            lines.append(f"\nCòn {len(self._agent_sources) - limit} tin khác trong kết quả truy vấn.")
+        return "\n\n".join(lines)
+
+    def _is_direct_poi_location_query(self, parsed: ParsedQuery) -> bool:
+        """Use deterministic POI lookup for 'around this project/place' queries."""
+        query_norm = _normalize_text(parsed.raw_query or parsed.query_text)
+        has_spatial_phrase = any(
+            phrase in query_norm
+            for phrase in ("xung quanh", "quanh", "gan ", "gan du an", "ban kinh", "trong ban kinh")
+        )
+        categories = self._poi_categories_from_parsed(parsed)
+        return (
+            "lifestyle_search" in set(parsed.intents or [])
+            and has_spatial_phrase
+            and bool(categories)
+            and bool(self._location_name_from_query(parsed.raw_query or parsed.query_text))
+        )
+
+    def _poi_categories_from_parsed(self, parsed: ParsedQuery) -> list[str]:
+        allowed = {"school", "hospital", "park", "shopping", "transit_station"}
+        categories = [signal for signal in (parsed.lifestyle_signals or []) if signal in allowed]
+        if categories:
+            return categories
+
+        query_norm = _normalize_text(parsed.raw_query or parsed.query_text)
+        inferred = []
+        for category, aliases in POI_CATEGORY_ALIASES.items():
+            if any(_normalize_text(alias) in query_norm for alias in aliases):
+                inferred.append(category)
+        return [category for category in inferred if category in allowed]
+
+    def _radius_m_from_query(self, query: str, default: int = 2000) -> int:
+        match = re.search(r"(\d+(?:[.,]\d+)?)\s*(km|m)\b", query, flags=re.IGNORECASE)
+        if not match:
+            return default
+        value = float(match.group(1).replace(",", "."))
+        unit = match.group(2).lower()
+        radius = value * 1000 if unit == "km" else value
+        return int(max(100, min(radius, 10000)))
+
+    def _location_name_from_query(self, query: str) -> str:
+        patterns = [
+            r"(?:dự án|du an)\s+(.+?)(?:\s+có\b|\s+co\b|\s+trong\b|\s+bán kính\b|\s+ban kinh\b|\?|$)",
+            r"(?:xung quanh|quanh|gần|gan)\s+(.+?)(?:\s+có\b|\s+co\b|\s+trong\b|\s+bán kính\b|\s+ban kinh\b|\?|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, query, flags=re.IGNORECASE)
+            if match:
+                name = re.sub(r"^(?:dự án|du an)\s+", "", match.group(1).strip(), flags=re.IGNORECASE)
+                name = re.sub(r"[,.;:]+$", "", name).strip()
+                if name:
+                    return name
+        return ""
+
+    def _format_direct_poi_answer(self, observation: str) -> str:
+        if not observation.strip():
+            return "Mình chưa tìm thấy POI phù hợp trong bán kính yêu cầu."
+        return observation.strip()
+
     def _query_stream_native_gemini(
         self,
         user_query: str,
@@ -2272,8 +2442,6 @@ class RAGChain:
         session_id: Optional[str] = None,
     ) -> Iterator[dict]:
         """Run the Gemini/Vertex agent using native function calls instead of text Action parsing."""
-        from google.genai import types
-
         self._agent_sources = []
         self._last_answer_package = {}
         effective_query = self._prepare_query_for_session(user_query, session_id)
@@ -2297,24 +2465,99 @@ class RAGChain:
             lifestyle_signals=parsed.lifestyle_signals,
         )
 
-        prompt = (
-            f"Câu hỏi của người dùng: {effective_query}\n\n"
-            f"Intent đã phân tích: {parsed.intent}\n"
-            f"Bộ lọc đã phân tích: {json.dumps(parsed.filters, ensure_ascii=False)}\n"
-            f"Tín hiệu lifestyle: {', '.join(parsed.lifestyle_signals or []) or 'không có'}\n\n"
-            "Hãy dùng function calls để lấy dữ liệu cần thiết trước khi trả lời. "
-            "Nếu người dùng hỏi vay, lãi suất, trả góp hoặc khả năng tài chính, dùng calculate_finance và không tự tính nhẩm. "
-            "Nếu người dùng hỏi POI quanh một dự án/địa điểm cụ thể theo bán kính, dùng find_pois_near_location. "
-            "Nếu cần kiểm tra tiêu chí gần POI khi tìm tin đăng, dùng find_listings_near_pois hoặc find_nearby_pois. "
-            "Nếu cần tìm mô tả như ít ngập/yên tĩnh/gần trường học trong dữ liệu, dùng hybrid_search."
-        )
-        contents: list[Any] = [
-            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-        ]
-        tools = self._native_tool_declarations()
         final_answer = ""
+        skip_final_synthesis = False
+        contents: list[Any] = []
+        tools: list[Any] = []
 
-        for iteration in range(max_iterations):
+        if self._is_direct_structured_listing_query(parsed):
+            tool_args = self._filter_args_from_parsed(parsed, limit=10)
+            args_json = json.dumps(tool_args, ensure_ascii=False)
+            self._trace(
+                "native_direct_filter_listing",
+                trace_id=trace_id,
+                mode="native_stream",
+                tool="filter_listings",
+                args=tool_args,
+            )
+            yield {"type": "status", "text": "🔎 Đang lọc tin đăng theo tiêu chí..."}
+            if stream_react_trace:
+                yield {"type": "tool_call", "text": f"filter_listings({args_json})"}
+            observation = self._execute_tool_args("filter_listings", tool_args)
+            tool_history.append({"name": "filter_listings", "args": tool_args, "observation": observation[:1200]})
+            self._trace(
+                "native_direct_filter_observation",
+                trace_id=trace_id,
+                mode="native_stream",
+                tool="filter_listings",
+                args=tool_args,
+                observation=observation,
+                source_count=len(self._agent_sources),
+            )
+            if stream_react_trace:
+                yield {"type": "observation", "text": observation}
+            final_answer = self._format_direct_listing_answer(parsed)
+            skip_final_synthesis = True
+        elif self._is_direct_poi_location_query(parsed):
+            tool_args = {
+                "location_name": self._location_name_from_query(parsed.raw_query or parsed.query_text),
+                "categories": self._poi_categories_from_parsed(parsed),
+                "radius_m": self._radius_m_from_query(parsed.raw_query or parsed.query_text),
+                "top_n_per_category": 8,
+            }
+            args_json = json.dumps(tool_args, ensure_ascii=False)
+            self._trace(
+                "native_direct_poi_location",
+                trace_id=trace_id,
+                mode="native_stream",
+                tool="find_pois_near_location",
+                args=tool_args,
+            )
+            yield {"type": "status", "text": "📍 Đang tìm tiện ích quanh địa điểm..."}
+            if stream_react_trace:
+                yield {"type": "tool_call", "text": f"find_pois_near_location({args_json})"}
+            observation = self._execute_tool_args("find_pois_near_location", tool_args)
+            tool_history.append({"name": "find_pois_near_location", "args": tool_args, "observation": observation[:1200]})
+            self._trace(
+                "native_direct_poi_observation",
+                trace_id=trace_id,
+                mode="native_stream",
+                tool="find_pois_near_location",
+                args=tool_args,
+                observation=observation,
+                source_count=len(self._agent_sources),
+            )
+            if stream_react_trace:
+                yield {"type": "observation", "text": observation}
+            final_answer = self._format_direct_poi_answer(observation)
+            skip_final_synthesis = True
+        else:
+            from google.genai import types
+
+            prompt = (
+                f"Câu hỏi của người dùng: {effective_query}\n\n"
+                f"Intent đã phân tích: {parsed.intent}\n"
+                f"Bộ lọc đã phân tích: {json.dumps(parsed.filters, ensure_ascii=False)}\n"
+                f"Tín hiệu lifestyle: {', '.join(parsed.lifestyle_signals or []) or 'không có'}\n\n"
+                "Hãy dùng function calls để lấy dữ liệu cần thiết trước khi trả lời. "
+                "Nếu người dùng hỏi vay, lãi suất, trả góp hoặc khả năng tài chính, dùng calculate_finance và không tự tính nhẩm. "
+                "Nếu người dùng hỏi POI quanh một dự án/địa điểm cụ thể theo bán kính, dùng find_pois_near_location. "
+                "Nếu cần kiểm tra tiêu chí gần POI khi tìm tin đăng, dùng find_listings_near_pois hoặc find_nearby_pois. "
+                "Nếu cần tìm mô tả như ít ngập/yên tĩnh/gần trường học trong dữ liệu, dùng hybrid_search."
+            )
+            contents = [
+                types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+            ]
+            allowed_tool_names = self._allowed_native_tool_names(parsed)
+            tools = self._native_tool_declarations(allowed_names=allowed_tool_names)
+            self._trace(
+                "native_toolset_selected",
+                trace_id=trace_id,
+                mode="native_stream",
+                tools=sorted(allowed_tool_names),
+            )
+
+        for iteration in range(max_iterations if not skip_final_synthesis else 0):
             response = self._llm.generate_with_tools(
                 contents=contents,
                 tools=tools,
@@ -2455,7 +2698,7 @@ class RAGChain:
                 parsed=parsed,
                 draft="",
             )
-        elif self._agent_sources and not self._should_ask_clarification_only(parsed, final_answer):
+        elif self._agent_sources and not skip_final_synthesis and not self._should_ask_clarification_only(parsed, final_answer):
             final_answer = self._synthesize_final_answer(
                 user_query=effective_query,
                 parsed=parsed,

@@ -2,3 +2,5 @@
 ragas
 langchain-community
 langchain-google-vertexai
+matplotlib
+seaborn

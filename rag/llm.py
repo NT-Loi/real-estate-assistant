@@ -2,11 +2,14 @@
 LLM Client — Google Gemini API wrapper using the google-genai SDK.
 
 Configuration (via .env or environment variables):
-  LLM_PROVIDER     — "vertexai", "gemini", or "ollama".
+  LLM_PROVIDER     — "vertexai", "gemini", "ollama", or "openai_compatible".
   PROJECT_ID       — GCP project ID (required when LLM_PROVIDER=vertexai).
   VERTEX_LOCATION  — Vertex AI location (optional, default: "global").
   GEMINI_API_KEY   — required when LLM_PROVIDER=gemini.
   GEMINI_MODEL     — optional. Default: gemini-2.5-flash.
+  OPENAI_BASE_URL  — OpenAI-compatible endpoint, e.g. a vLLM server /v1 URL.
+  OPENAI_MODEL     — Model name served by the OpenAI-compatible endpoint.
+  OPENAI_API_KEY   — API key for the endpoint. Use any non-empty value for local vLLM.
 
 Falls back to a formatted text response if no LLM provider is available.
 """
@@ -29,11 +32,24 @@ log = logging.getLogger("bds_llm")
 
 
 def _request_timeout_ms() -> int:
-    raw = os.getenv("GEMINI_REQUEST_TIMEOUT_MS", os.getenv("LLM_REQUEST_TIMEOUT_MS", "120000"))
+    raw = os.getenv("GEMINI_REQUEST_TIMEOUT_MS", os.getenv("LLM_REQUEST_TIMEOUT_MS", "45000"))
     try:
         return max(1000, int(raw))
     except (TypeError, ValueError):
-        return 120000
+        return 45000
+
+
+def _afc_max_remote_calls() -> int:
+    raw = os.getenv("GEMINI_AFC_MAX_REMOTE_CALLS", "3")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _disable_sdk_afc() -> bool:
+    raw = os.getenv("GEMINI_DISABLE_SDK_AFC", "true")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class LLMClient:
@@ -58,6 +74,23 @@ class LLMClient:
 
         self._ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
         self._ollama_model = os.environ.get("OLLAMA_MODEL")
+        self._openai_base_url = (
+            os.environ.get("OPENAI_COMPATIBLE_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or ""
+        ).rstrip("/")
+        self._openai_model = (
+            os.environ.get("OPENAI_COMPATIBLE_MODEL")
+            or os.environ.get("OPENAI_MODEL")
+            or os.environ.get("VLLM_MODEL")
+            or ""
+        )
+        self._openai_api_key = (
+            os.environ.get("OPENAI_COMPATIBLE_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("VLLM_API_KEY")
+            or "dummy"
+        )
 
         self._client = None
         self._available = False
@@ -68,6 +101,8 @@ class LLMClient:
                 self._provider = "vertexai"
             elif self._api_key and self._api_key != "your_gemini_api_key_here":
                 self._provider = "gemini"
+            elif self._openai_base_url and self._openai_model:
+                self._provider = "openai_compatible"
             else:
                 self._provider = "ollama"
 
@@ -82,6 +117,41 @@ class LLMClient:
                     log.warning(f"Ollama server returned status {resp.status_code} at {self._ollama_base_url}")
             except Exception as e:
                 log.warning(f"Failed to connect to Ollama server at {self._ollama_base_url}: {e}")
+
+        elif self._provider in {"openai_compatible", "openai-compatible", "vllm"}:
+            self._provider = "openai_compatible"
+            if not self._openai_base_url or not self._openai_model:
+                log.warning(
+                    "LLM_PROVIDER=openai_compatible requires OPENAI_BASE_URL and OPENAI_MODEL. "
+                    "Disabling LLM."
+                )
+            else:
+                self._available = True
+                log.info(
+                    "OpenAI-compatible LLM initialized (Model: %s, Endpoint: %s)",
+                    self._openai_model,
+                    self._openai_base_url,
+                )
+                if os.getenv("OPENAI_COMPATIBLE_HEALTHCHECK", "false").lower() in {"1", "true", "yes"}:
+                    try:
+                        import requests
+                        resp = requests.get(
+                            self._openai_url("/models"),
+                            headers=self._openai_headers(),
+                            timeout=5.0,
+                        )
+                        if resp.status_code >= 400:
+                            log.warning(
+                                "OpenAI-compatible healthcheck returned status %s at %s",
+                                resp.status_code,
+                                self._openai_base_url,
+                            )
+                    except Exception as e:
+                        log.warning(
+                            "OpenAI-compatible healthcheck failed at %s: %s",
+                            self._openai_base_url,
+                            e,
+                        )
 
         elif self._provider == "vertexai":
             if not self._project_id:
@@ -135,6 +205,77 @@ class LLMClient:
         """Whether the configured provider can return native function calls."""
         return self._available and self._provider in {"gemini", "vertexai"} and self._client is not None
 
+    def _openai_url(self, path: str) -> str:
+        base = self._openai_base_url.rstrip("/")
+        if not path.startswith("/"):
+            path = "/" + path
+        return base + path
+
+    def _openai_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._openai_api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _openai_messages(self, prompt: str, system_prompt: Optional[str] = None) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _openai_timeout_seconds(self) -> float:
+        return _env_float_like("OPENAI_REQUEST_TIMEOUT_SECONDS", _request_timeout_seconds())
+
+    @staticmethod
+    def _extract_openai_text(data: dict[str, Any]) -> str:
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+            return "".join(texts).strip()
+        return ""
+
+    def _openai_chat_completion(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+        response_format: Optional[dict[str, Any]] = None,
+    ) -> str:
+        import requests
+
+        payload: dict[str, Any] = {
+            "model": self._openai_model,
+            "messages": self._openai_messages(prompt, system_prompt),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if response_format:
+            payload["response_format"] = response_format
+        else:
+            payload["stop"] = ["Observation:", "Observation:\n"]
+
+        resp = requests.post(
+            self._openai_url("/chat/completions"),
+            headers=self._openai_headers(),
+            json=payload,
+            timeout=self._openai_timeout_seconds(),
+        )
+        resp.raise_for_status()
+        return self._extract_openai_text(resp.json())
+
     def generate_with_tools(
         self,
         contents: Any,
@@ -162,6 +303,11 @@ class LLMClient:
         except Exception:
             tool_config = None
 
+        disable_sdk_afc = _disable_sdk_afc()
+        afc_kwargs = {"disable": disable_sdk_afc}
+        if not disable_sdk_afc:
+            afc_kwargs["maximum_remote_calls"] = _afc_max_remote_calls()
+
         config = types.GenerateContentConfig(
             http_options=types.HttpOptions(timeout=_request_timeout_ms()),
             max_output_tokens=max_tokens,
@@ -169,7 +315,7 @@ class LLMClient:
             system_instruction=system_prompt or "",
             tools=tools,
             tool_config=tool_config,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(**afc_kwargs),
         )
 
         models_to_try = [self._model_name]
@@ -180,11 +326,25 @@ class LLMClient:
         for model in models_to_try:
             for attempt in range(3):
                 try:
-                    return self._client.models.generate_content(
+                    started = time.time()
+                    log.info(
+                        "Native tool LLM request start [%s] tools=%s timeout_ms=%s attempt=%s",
+                        model,
+                        len(tools or []),
+                        _request_timeout_ms(),
+                        attempt + 1,
+                    )
+                    response = self._client.models.generate_content(
                         model=model,
                         contents=contents,
                         config=config,
                     )
+                    log.info(
+                        "Native tool LLM request done [%s] elapsed=%.2fs",
+                        model,
+                        time.time() - started,
+                    )
+                    return response
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
@@ -258,6 +418,23 @@ class LLMClient:
                 return content_clean
             except Exception as e:
                 log.error(f"Ollama generation error [{self._ollama_model}]: {e}")
+                return ""
+
+        if self._provider == "openai_compatible":
+            try:
+                return self._openai_chat_completion(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception as e:
+                log.error(
+                    "OpenAI-compatible generation error [%s @ %s]: %s",
+                    self._openai_model,
+                    self._openai_base_url,
+                    e,
+                )
                 return ""
 
         else:
@@ -338,6 +515,29 @@ class LLMClient:
             try:
                 return json.loads(raw)
             except Exception:
+                return None
+
+        if self._provider == "openai_compatible":
+            json_prompt = (
+                f"{prompt}\n\n"
+                "Return only one valid JSON object. Do not wrap it in markdown."
+            )
+            try:
+                raw = self._openai_chat_completion(
+                    prompt=json_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    response_format={"type": "json_object"},
+                )
+                return json.loads(raw) if raw else None
+            except Exception as e:
+                log.warning(
+                    "OpenAI-compatible JSON generation error [%s @ %s]: %s",
+                    self._openai_model,
+                    self._openai_base_url,
+                    e,
+                )
                 return None
 
         import time
@@ -475,6 +675,53 @@ class LLMClient:
 
             except Exception as e:
                 log.error(f"Ollama streaming error [{self._ollama_model}]: {e}")
+                return
+
+        elif self._provider == "openai_compatible":
+            import requests
+            try:
+                payload = {
+                    "model": self._openai_model,
+                    "messages": self._openai_messages(prompt, system_prompt),
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                    "stop": ["Observation:", "Observation:\n"],
+                }
+                resp = requests.post(
+                    self._openai_url("/chat/completions"),
+                    headers=self._openai_headers(),
+                    json=payload,
+                    stream=True,
+                    timeout=self._openai_timeout_seconds(),
+                )
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if line.startswith("data:"):
+                        line = line[len("data:"):].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    token = delta.get("content")
+                    if token:
+                        yield token
+            except Exception as e:
+                log.error(
+                    "OpenAI-compatible streaming error [%s @ %s]: %s",
+                    self._openai_model,
+                    self._openai_base_url,
+                    e,
+                )
                 return
 
         else:
